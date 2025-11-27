@@ -1,0 +1,7 @@
+*.pyc
+__pycache__/
+.env
+server/data/
+client/build/
+*.bin
+*.swp

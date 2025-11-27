@@ -1,0 +1,24 @@
+layout: 2x2
+dateline: true
+
+panels:
+  - headlines:
+      - type: rss
+      - url: https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
+      - max_items: 5
+      - refresh_interval: 600
+
+  - weather:
+      - type: weather
+      - location: "40.7128,-74.0060"  # New York City
+      - refresh_interval: 1800
+
+  - tech_news:
+      - type: rss
+      - url: https://hnrss.org/frontpage
+      - max_items: 10
+      - refresh_interval: 900
+
+  - web_demo:
+      - type: webpage
+      - url: https://www.bbc.com

@@ -1,0 +1,67 @@
+name: Build ESPHome firmware
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-esphome:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Build ESPHome firmware
+        run: bash ./build-esphome.sh
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esphome-firmware
+          path: client/build
+
+  test-server:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Sync server environment
+        working-directory: server
+        run: uv sync
+
+      - name: Run basic server integration test
+        working-directory: server
+        run: |
+          uv run webInk.py &
+          SERVER_PID=$!
+
+          # Wait for server to become ready
+          READY=0
+          for i in {1..60}; do
+            if curl -sSf http://127.0.0.1:8000/api/config >/dev/null; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "Server did not become ready in time" >&2
+            kill "$SERVER_PID" || true
+            exit 1
+          fi
+
+          uv run test_client.py --server http://127.0.0.1:8000 --api-key myapikey --device test_device --mode 800x480x1xB --tile-size 200 --no-sleep --basic
+
+          kill "$SERVER_PID" || true
+          wait "$SERVER_PID" || true

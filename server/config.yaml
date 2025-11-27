@@ -1,0 +1,83 @@
+# webInk Configuration File
+# Configure web pages to capture and devices to serve
+#
+# Page Configuration Options:
+#   - url: The URL to capture
+#   - refresh_interval: How often to refresh in seconds (default: 600)
+#   - suppress_refresh: Time period to skip refreshes (start/end in HH:MM format)
+#   - mandatory_refresh: List of times to always refresh (HH:MM format)
+#   - zoom_level: Capture at higher resolution then downscale (default: 1.0)
+#                 Example: zoom_level: 2 captures at 2x resolution (1600x960 for 800x480)
+#                 and downscales using high-quality Lanczos resampling before dithering
+#   - scroll_to_element: CSS selector to scroll to before screenshot (default: None)
+#                        Example: scroll_to_element: "main" or "#content" or ".article"
+#                        Useful for skipping large ads or navigating to specific content
+
+pages:
+  - dashboard:
+      - url: http://localhost:8080/
+      - refresh_interval: 300
+
+  # New York Times - News page
+  - nytimes:
+      - url: https://nytimes.com
+      - refresh_interval: 300  # Refresh every 5 minutes
+      - scroll_to_element: "main"  # Skip large ad at top
+      - zoom_level: 4
+
+  # Google homepage  
+  - google:
+      - url: https://google.com
+      - refresh_interval: 600  # Default 10 minutes
+      - suppress_refresh:
+          start: "01:00"   # Don't refresh between 1 AM
+          end: "08:00"     # and 8 AM (save battery)
+      - mandatory_refresh:
+          - "08:00"        # Always refresh at 8 AM
+          - "12:00"        # and noon
+          - "18:00"        # and 6 PM
+
+  # Weather page
+  - weather:
+      - url: https://weather.com
+      - refresh_interval: 1800  # Every 30 minutes
+
+  # Wikipedia random article
+  - wikipedia:
+      - url: https://en.wikipedia.org/wiki/Special:Random
+      - refresh_interval: 3600  # Every hour
+      - zoom_level: 2  # Capture at 2x resolution for better quality
+
+devices:
+  # Default device configuration
+  - default:
+      - page: nytimes
+  
+  # Kitchen display shows weather
+  - kitchen:
+      - page: weather
+  
+  # Living room shows Wikipedia
+  - livingroom:
+      - page: wikipedia
+
+# Supported display modes
+# Format: WIDTHxHEIGHTxBITSxCOLORMODE
+# COLORMODE: B=Black&White, G=Grayscale, RGB=Color
+supported_modes:
+  - "800x480x1xB"      # 800x480 1-bit black & white
+  - "800x480x2xG"      # 800x480 4-level grayscale
+  - "800x480x2xRGB"    # 800x480 4-color (B/R/G/B)
+  - "800x480x8xRGB"    # 800x480 full color (for dashboard)
+  - "1024x758x1xB"     # Kindle-like resolution B&W
+  - "1600x1200x1xB"    # High-res eInk display
+  - "1920x1080x8xRGB"  # Full HD for web dashboard
+
+# API authentication key
+api_key: myapikey
+
+# TCP Socket Server Configuration
+# Port for low-power embedded devices to connect via raw TCP/IP
+# Uses webInkV1 protocol (see SOCKET_PROTOCOL.md for details)
+socket_port: 8091
+
