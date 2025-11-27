@@ -10,15 +10,15 @@ webInk is a Python web server that captures and renders any web page in a tiled 
 
 ## Quick Start
 
-1) Start the server on a Raspberry Pi or laptop: docker run --rm -p 8000:8000 -p 8080:8080 -p 8091:8091 --name webink webink:1.0.0
+1) Start the server on a Raspberry Pi or laptop: docker run --rm -p 8000:8000 -p 8080:8080 -p 8091:8091 --name webink webink:1.0.0 
 
-2) Use the captive Wi-Fi portal (SSID: webInk-01) to configure your device with your Wi-Fi credentials
+2) Use ESPHome Web to flash the pre-built firmware image for your device, or build a custome firmware image using the ESPHome IDE.
 
-3) Use ESPHome Web to flash the pre-built firmware for your device
+3) Use the captive Wi-Fi portal (SSID: webInk-01) to configure your device with your Wi-Fi credentials.
 
-4) The device will display its own IP address on-screen. Navigate to the web configuration interface on that IP address, and configure it to point at the webInk server. 
-
-  * (The default server address is homeassistant.local, which will automatically connect if you happen to be running it on the same server as Home Assistant. It's fine if you are not, though.)
+4) The device will display its own IP address on-screen. Navigate to the web configuration interface on that IP address, and configure it to point at the webInk server.
+ 
+(By default, the server address is homeassistant.local, so it will automatically connect if you happen to be running the webInk server on the same box as Home Assistant and mDNS is working. It's fine if you use a separate server, though - they are not integrated in any way.)
 
 ## Components
 ### Python Server
@@ -38,30 +38,6 @@ A few demo apps are included to help get started quickly with your eInk display.
 
 ### Home Dashboard
 Home Dashboard is a customizable personal dashboard. It can show weather, calendar, Home Assistant sensors, RSS feeds, and other data sources. It can show up to four of these at a time. 
-
-## Future ideas
-Just some brainstorming for other things that could be done with this.
-
-### Simple Signage
-A web based signage system. You can log in and change the contents of the sign at any time. Use it to display messages for your loved ones, or specials at a store or restaurant. 
-
-### Calendar Reservation
-The Calendar Reservation App connects to a calendar and shows a nicely formatted schedule of events for a room. It can be used for conference rooms, equipment, or other situations where you want to display current and upcoming events.
-
-### Grafana Display
-The Grafana Display shows a single graph from Grafana. This is useful for displaying system status. For example, you can show home server load in a place you can easily see it. 
-
-### Transit Display
-Shows an upcoming transit departure schedule. You specify the GTFS-RT feed for your transit provider. You can put it near your door so you know when to leave to catch the next bus. 
-
-### Habit Streak
-You get checkboxes each day for tracking habits of your choice, which can be checked off through a web app. For some people, having this visual reminder helps build consistency in developing positive routines.
-
-### Mealie
-Automatically shows your week's planned meals from a Mealie server. (If it can't connect to Mealie, it just displays a demo randomly-generated menu). Great for putting in the kitchen. 
-
-### Health
-Show your health data from Apple Health. For this to work, you must configure a paid iOS app called "Health Auto Export which syncs your health data to the server.
 
 ## Alternatives
 - sibbl/hass-lovelace-screensaver exports any Home Assistant dashboard as a static image
