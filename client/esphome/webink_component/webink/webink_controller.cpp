@@ -91,8 +91,10 @@ void WebInkController::loop() {
         network_->update();
     }
     
-    // Check for state timeout
-    if (has_state_timed_out()) {
+    // Check for state timeout (skip IDLE and COMPLETE - they are waiting states)
+    if (current_state_ != UpdateState::IDLE && 
+        current_state_ != UpdateState::COMPLETE &&
+        has_state_timed_out()) {
         ESP_LOGW(TAG, "[TIMEOUT] State %s timed out after %lu ms",
                  update_state_to_string(current_state_), STATE_TIMEOUT_MS);
         handle_error(ErrorType::SERVER_UNREACHABLE, "State machine timeout");
@@ -345,9 +347,10 @@ void WebInkController::transition_to_state(UpdateState new_state) {
         
         log_state_transition(old_state, new_state);
         
-        if (on_state_change) {
-            on_state_change(old_state, new_state);
-        }
+        // DISABLED: std::function callback causes stack overflow on ESP32C3
+        // if (on_state_change) {
+        //     on_state_change(old_state, new_state);
+        // }
     }
 }
 
@@ -389,8 +392,7 @@ void WebInkController::handle_idle_state() {
         transition_to_state(UpdateState::WIFI_WAIT);
         
         update_progress(0.0f, "Starting update cycle");
-        
-        post_status_to_server("Update cycle starting - wake #" + std::to_string(state_.wake_counter));
+        // post_status_to_server disabled - string concat causes stack overflow
     }
 }
 
@@ -402,17 +404,24 @@ void WebInkController::handle_wifi_wait_state() {
         wifi_connected = get_wifi_status();
     }
     
+    // Debug: Log WiFi status periodically (every 2 seconds)
+    static unsigned long last_wifi_log = 0;
+    unsigned long now = millis();
+    if (now - last_wifi_log > 2000) {
+        ESP_LOGD(TAG, "[WIFI] Status check: connected=%s, time_in_state=%lu ms", 
+                 wifi_connected ? "true" : "false", get_time_in_current_state());
+        last_wifi_log = now;
+    }
+    
     if (wifi_connected) {
         ESP_LOGI(TAG, "[WIFI] WiFi connected, proceeding to hash check");
         transition_to_state(UpdateState::HASH_REQUEST);
         update_progress(10.0f, "WiFi connected");
     } else {
-        // Check for timeout
-        if (get_time_in_current_state() > 10000) {  // 10 second timeout
-            ESP_LOGW(TAG, "[WIFI] WiFi connection timeout");
-            handle_error(ErrorType::WIFI_TIMEOUT, "WiFi connection timeout after 10 seconds");
-        } else {
-            update_progress(5.0f, "Waiting for WiFi connection");
+        // Check for timeout - increased to 30 seconds for slow WiFi connections
+        if (get_time_in_current_state() > 30000) {  // 30 second timeout
+            ESP_LOGW(TAG, "[WIFI] WiFi connection timeout after 30 seconds");
+            handle_error(ErrorType::WIFI_TIMEOUT, "WiFi connection timeout after 30 seconds");
         }
     }
 }
@@ -426,17 +435,23 @@ void WebInkController::handle_hash_request_state() {
     std::string hash_url = config_->build_hash_url();
     ESP_LOGI(TAG, "[HASH] Requesting hash from: %s", hash_url.c_str());
     
+    // Note: http_get_async is actually blocking - callback fires immediately
+    // The callback handles state transitions, so we don't transition here
     bool request_started = network_->http_get_async(hash_url, 
         [this](NetworkResult result) {
             this->on_hash_response(result);
         }, NETWORK_TIMEOUT_MS);
     
-    if (request_started) {
-        transition_to_state(UpdateState::HASH_PARSE);
-        update_progress(20.0f, "Requesting content hash");
-    } else {
+    if (!request_started) {
         handle_error(ErrorType::SERVER_UNREACHABLE, "Failed to start hash request");
     }
+    // State transition happens in on_hash_response callback
+}
+
+void WebInkController::handle_hash_check_state() {
+    // Transition to hash request - this is just a passthrough state
+    transition_to_state(UpdateState::HASH_REQUEST);
+    update_progress(15.0f, "Checking hash");
 }
 
 void WebInkController::handle_hash_parse_state() {
@@ -447,10 +462,13 @@ void WebInkController::handle_hash_parse_state() {
 }
 
 void WebInkController::handle_image_request_state() {
-    ESP_LOGI(TAG, "[IMAGE] Starting image request");
+    ESP_LOGI(TAG, "[IMAGE] Starting image request, socket_port=%d", config_->socket_mode_port);
     
     // Calculate image parameters
     calculate_image_parameters();
+    
+    // Initialize slice tracking
+    rows_completed_ = 0;
     
     if (config_->get_network_mode() == NetworkMode::TCP_SOCKET) {
         // Use TCP socket mode for full image download
@@ -461,49 +479,172 @@ void WebInkController::handle_image_request_state() {
         
         if (network_->socket_connect_async(host, port)) {
             transition_to_state(UpdateState::IMAGE_DOWNLOAD);
-            update_progress(40.0f, "Connecting to image server");
         } else {
             handle_error(ErrorType::SOCKET_ERROR, "Failed to connect to image server");
         }
     } else {
-        // Use HTTP sliced mode
+        // Use HTTP sliced mode - transition to IMAGE_DOWNLOAD which handles the loop
         ESP_LOGI(TAG, "[IMAGE] Using HTTP sliced mode");
+        transition_to_state(UpdateState::IMAGE_DOWNLOAD);
+    }
+}
+
+void WebInkController::handle_image_download_state() {
+    // HTTP sliced mode - request current slice
+    if (config_->get_network_mode() == NetworkMode::HTTP_SLICED) {
+        // Check if all slices received
+        if (rows_completed_ >= total_image_rows_) {
+            ESP_LOGI(TAG, "[IMAGE] All %d rows received", rows_completed_);
+            transition_to_state(UpdateState::DISPLAY_UPDATE);
+            return;
+        }
         
-        // Start with first slice
-        rows_completed_ = 0;
-        current_image_request_.rect = DisplayRect(0, 0, 800, config_->rows_per_slice);
-        current_image_request_.start_row = 0;
-        current_image_request_.num_rows = config_->rows_per_slice;
+        // Request next slice
+        int remaining_rows = total_image_rows_ - rows_completed_;
+        int rows_to_request = std::min(config_->rows_per_slice, remaining_rows);
+        
+        current_image_request_.rect = DisplayRect(0, rows_completed_, 800, rows_to_request);
+        current_image_request_.start_row = rows_completed_;
+        current_image_request_.num_rows = rows_to_request;
         current_image_request_.format = "pbm";
         
         std::string image_url = config_->build_image_url(current_image_request_);
+        ESP_LOGD(TAG, "[IMAGE] Requesting rows %d-%d of %d", rows_completed_, 
+                 rows_completed_ + rows_to_request, total_image_rows_);
         
         bool request_started = network_->http_get_async(image_url,
             [this](NetworkResult result) {
                 this->on_image_response(result);
             }, NETWORK_TIMEOUT_MS);
         
-        if (request_started) {
-            transition_to_state(UpdateState::IMAGE_DOWNLOAD);
-            update_progress(50.0f, "Requesting image data");
-        } else {
-            handle_error(ErrorType::SERVER_UNREACHABLE, "Failed to start image request");
+        if (!request_started) {
+            handle_error(ErrorType::SERVER_UNREACHABLE, "Failed to request image slice");
         }
+        // on_image_response will increment rows_completed_ and we'll be called again
+        return;
     }
-}
-
-void WebInkController::handle_image_download_state() {
-    // Update progress based on rows completed
+    
+    // TCP Socket mode - send request and receive image
+    static bool socket_request_sent = false;
+    static bool socket_receive_started = false;
+    
+    // Check if socket is connected
+    if (!network_->socket_is_connected()) {
+        ESP_LOGD(TAG, "[SOCKET] Waiting for connection...");
+        return;
+    }
+    
+    // Send request once connected
+    if (!socket_request_sent) {
+        // Build and send socket request
+        ImageRequest req;
+        req.rect = DisplayRect(0, 0, 800, total_image_rows_);
+        req.start_row = 0;
+        req.num_rows = total_image_rows_;
+        req.format = "pbm";
+        
+        std::string request = config_->build_socket_request(req);
+        ESP_LOGI(TAG, "[SOCKET] Sending request: %s", request.c_str());
+        
+        if (!network_->socket_send(request)) {
+            handle_error(ErrorType::SOCKET_ERROR, "Failed to send socket request");
+            socket_request_sent = false;
+            socket_receive_started = false;
+            return;
+        }
+        socket_request_sent = true;
+        ESP_LOGI(TAG, "[SOCKET] Request sent, waiting for image data");
+        return;
+    }
+    
+    // Start receive stream (only once)
+    if (!socket_receive_started) {
+        // Use static variables inside lambda for row buffering
+        bool started = network_->socket_receive_stream(
+            [this](const uint8_t* data, int length) {
+                // Static buffer to accumulate partial rows (persists across calls)
+                static const int BYTES_PER_ROW = 800 / 8;  // 100 bytes per row
+                static uint8_t row_buffer[BYTES_PER_ROW];
+                static int buffer_pos = 0;
+                
+                // Reset buffer at start of new image (when rows_completed_ is 0)
+                if (rows_completed_ == 0) {
+                    buffer_pos = 0;
+                }
+                
+                ESP_LOGD(TAG, "[SOCKET] Received %d bytes, buffer_pos=%d, rows=%d", 
+                         length, buffer_pos, rows_completed_);
+                
+                if (!display_ || length <= 0) return;
+                
+                int data_pos = 0;
+                
+                while (data_pos < length) {
+                    // Fill buffer with incoming data
+                    int bytes_needed = BYTES_PER_ROW - buffer_pos;
+                    int bytes_available = length - data_pos;
+                    int bytes_to_copy = std::min(bytes_needed, bytes_available);
+                    
+                    memcpy(row_buffer + buffer_pos, data + data_pos, bytes_to_copy);
+                    buffer_pos += bytes_to_copy;
+                    data_pos += bytes_to_copy;
+                    
+                    // If we have a complete row, draw it
+                    if (buffer_pos >= BYTES_PER_ROW) {
+                        display_->draw_progressive_pixels(0, rows_completed_, 800, 1,
+                                                         row_buffer, ColorMode::MONO_BLACK_WHITE);
+                        rows_completed_++;
+                        buffer_pos = 0;
+                    }
+                }
+            },
+            800 * total_image_rows_ / 8,  // Max bytes for full image
+            NETWORK_TIMEOUT_MS
+        );
+        
+        if (started) {
+            socket_receive_started = true;
+            ESP_LOGI(TAG, "[SOCKET] Receive stream started");
+        } else {
+            handle_error(ErrorType::SOCKET_ERROR, "Failed to start socket receive");
+            socket_request_sent = false;
+            socket_receive_started = false;
+        }
+        return;
+    }
+    
+    // Let network update() handle the receive - check if operation completed
+    if (!network_->is_operation_pending()) {
+        ESP_LOGI(TAG, "[SOCKET] Image transfer complete");
+        socket_request_sent = false;
+        socket_receive_started = false;
+        network_->socket_close();
+        transition_to_state(UpdateState::DISPLAY_UPDATE);
+    }
+    
+    // Update progress
     if (total_image_rows_ > 0) {
         float progress = 50.0f + (rows_completed_ * 30.0f) / total_image_rows_;
         current_progress_ = progress;
-        
-        if (on_progress_update) {
-            on_progress_update(progress, current_status_);
-        }
     }
+}
+
+void WebInkController::handle_image_parse_state() {
+    ESP_LOGI(TAG, "[IMAGE] Parsing image data");
+    update_progress(75.0f, "Processing image data");
     
-    // State transitions happen in network callbacks
+    // In a full implementation, this would parse received image data
+    // For now, just transition to display
+    transition_to_state(UpdateState::IMAGE_DISPLAY);
+}
+
+void WebInkController::handle_image_display_state() {
+    ESP_LOGI(TAG, "[IMAGE] Drawing image to display buffer");
+    update_progress(85.0f, "Drawing image to buffer");
+    
+    // In a full implementation, this would draw pixels to display buffer
+    // For now, just transition to display update
+    transition_to_state(UpdateState::DISPLAY_UPDATE);
 }
 
 void WebInkController::handle_display_update_state() {
@@ -543,7 +684,7 @@ void WebInkController::handle_sleep_prepare_state() {
         
         if (request_started) {
             sleep_interval_requested = true;
-            update_progress(95.0f, "Getting sleep interval from server");
+            update_progress(95.0f, "Getting sleep interval");
             ESP_LOGD(TAG, "[SLEEP] Sleep interval request started");
         } else {
             ESP_LOGW(TAG, "[SLEEP] Failed to request sleep interval - using default");
@@ -602,15 +743,17 @@ void WebInkController::on_hash_response(NetworkResult result) {
     // Parse JSON response: {"hash":"abcd1234"}
     std::string hash_response = result.data;
     size_t hash_pos = hash_response.find("\"hash\":\"");
+    size_t value_offset = 8;  // length of "hash":"
     if (hash_pos == std::string::npos) {
         hash_pos = hash_response.find("\"hash\": \"");
+        value_offset = 9;  // length of "hash": " (with space)
     }
     
     if (hash_pos != std::string::npos) {
-        size_t start = hash_response.find("\"", hash_pos + 8) + 1;
+        size_t start = hash_pos + value_offset;  // First char of hash value
         size_t end = hash_response.find("\"", start);
         
-        if (end != std::string::npos) {
+        if (end != std::string::npos && end > start) {
             current_hash_ = hash_response.substr(start, end - start);
             ESP_LOGI(TAG, "[HASH] Parsed hash: %s", current_hash_.c_str());
             
@@ -636,23 +779,50 @@ void WebInkController::on_image_response(NetworkResult result) {
         return;
     }
     
-    ESP_LOGI(TAG, "[IMAGE] Received %d bytes of image data", result.bytes_received);
+    ESP_LOGI(TAG, "[IMAGE] Received %d bytes of image data (rows %d-%d)", 
+             result.bytes_received, rows_completed_, 
+             rows_completed_ + current_image_request_.num_rows);
     
-    // Process the received image data
-    if (validate_image_data(reinterpret_cast<const uint8_t*>(result.data.data()), result.data.size())) {
-        // In a full implementation, this would process the image chunk
-        rows_completed_ += config_->rows_per_slice;
+    if (result.bytes_received > 0) {
+        // Parse PBM and render to display
+        const uint8_t* data = reinterpret_cast<const uint8_t*>(result.data.data());
+        size_t data_size = result.data.size();
         
-        if (rows_completed_ >= total_image_rows_) {
-            ESP_LOGI(TAG, "[IMAGE] All image data received");
-            transition_to_state(UpdateState::DISPLAY_UPDATE);
-        } else {
-            // Request next slice
-            ESP_LOGD(TAG, "[IMAGE] Requesting next slice (%d/%d rows complete)",
-                     rows_completed_, total_image_rows_);
+        // Skip PBM header to find pixel data
+        // PBM P4 format: "P4\n<width> <height>\n<binary data>"
+        size_t pixel_start = 0;
+        int newline_count = 0;
+        for (size_t i = 0; i < data_size && newline_count < 2; i++) {
+            if (data[i] == '\n') {
+                newline_count++;
+                if (newline_count == 2) {
+                    pixel_start = i + 1;
+                    break;
+                }
+            }
         }
+        
+        // Render pixels to display if we have display manager and pixel data
+        if (display_ && pixel_start < data_size) {
+            int width = 800;  // TODO: get from config
+            int height = current_image_request_.num_rows;
+            const uint8_t* pixel_data = data + pixel_start;
+            
+            // Draw this slice to the display buffer
+            display_->draw_progressive_pixels(0, rows_completed_, width, height,
+                                             pixel_data, ColorMode::MONO_BLACK_WHITE);
+            
+            ESP_LOGD(TAG, "[IMAGE] Rendered rows %d-%d to display buffer", 
+                     rows_completed_, rows_completed_ + height);
+        }
+        
+        // Increment rows completed
+        rows_completed_ += current_image_request_.num_rows;
+        
+        ESP_LOGD(TAG, "[IMAGE] Progress: %d/%d rows complete", 
+                 rows_completed_, total_image_rows_);
     } else {
-        handle_error(ErrorType::PARSE_ERROR, "Invalid image data received");
+        handle_error(ErrorType::PARSE_ERROR, "Empty image data received");
     }
 }
 
@@ -665,9 +835,12 @@ void WebInkController::on_sleep_response(NetworkResult result) {
     
     ESP_LOGI(TAG, "[SLEEP] Received sleep interval response: %s", result.data.c_str());
     
-    // Parse JSON response: {"sleep": 1800} or {"sleep_duration": 1800}
+    // Parse JSON response: {"sleep": 1800} or {"sleep_duration": 1800} or {"sleep_seconds": 1800}
     std::string sleep_response = result.data;
-    size_t sleep_pos = sleep_response.find("\"sleep\":");
+    size_t sleep_pos = sleep_response.find("\"sleep_seconds\":");
+    if (sleep_pos == std::string::npos) {
+        sleep_pos = sleep_response.find("\"sleep\":");
+    }
     if (sleep_pos == std::string::npos) {
         sleep_pos = sleep_response.find("\"sleep_duration\":");
     }
@@ -750,7 +923,8 @@ void WebInkController::display_error_and_sleep(ErrorType error_type, const std::
         display_->draw_error_message(error_type, details);
     }
     
-    post_status_to_server("ERROR: " + std::string(error_type_to_string(error_type)) + " - " + details);
+    // DISABLED: String concatenation causes stack overflow on ESP32C3
+    // post_status_to_server("ERROR: " + std::string(error_type_to_string(error_type)) + " - " + details);
     
     transition_to_state(UpdateState::ERROR_DISPLAY);
 }
@@ -780,13 +954,12 @@ void WebInkController::initialize_components() {
 }
 
 bool WebInkController::validate_configuration() {
-    std::vector<std::string> errors;
+    // Use char buffer for config validation (matches header signature)
+    char error_buffer[512];
+    error_buffer[0] = '\0';  // Initialize as empty
     
-    if (!config_->validate_configuration(errors)) {
-        ESP_LOGE(TAG, "[CONFIG] Configuration validation failed:");
-        for (const std::string& error : errors) {
-            ESP_LOGE(TAG, "  %s", error.c_str());
-        }
+    if (!config_->validate_configuration(error_buffer, sizeof(error_buffer))) {
+        ESP_LOGE(TAG, "[CONFIG] Configuration validation failed: %s", error_buffer);
         return false;
     }
     
@@ -874,10 +1047,10 @@ void WebInkController::on_log_response(NetworkResult result) {
 }
 
 void WebInkController::log_state_transition(UpdateState from_state, UpdateState to_state) {
-    ESP_LOGI(TAG, "[STATE] %s -> %s (%.3fs in previous state)",
-             update_state_to_string(from_state),
-             update_state_to_string(to_state),
-             get_time_in_current_state() / 1000.0f);
+    // Simplified to avoid stack overflow - split into separate log calls
+    const char* from_str = update_state_to_string(from_state);
+    const char* to_str = update_state_to_string(to_state);
+    ESP_LOGI(TAG, "[STATE] %s -> %s", from_str, to_str);
 }
 
 void WebInkController::reset_operation_state() {

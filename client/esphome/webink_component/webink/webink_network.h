@@ -285,48 +285,33 @@ private:
     std::function<void(NetworkResult)> http_callback_;
     bool http_operation_pending_;
 
+    // ESP32 HTTP client state (non-Mac mode)
+#ifndef WEBINK_MAC_INTEGRATION_TEST
+    esp_http_client_handle_t esp_http_client_;
+    std::string http_response_buffer_;
+    bool http_request_in_progress_;
+#endif
+
     // Socket state
 #ifdef WEBINK_MAC_INTEGRATION_TEST
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <curl/curl.h>
-#include <cstring>
-
-class MacSocket {
-public:
-    MacSocket() : fd_(-1) {}
-    ~MacSocket() { if (fd_ != -1) close(fd_); }
-    
-    bool connect(const std::string& host, int port);
-    ssize_t write(const void* data, size_t len);
-    bool ready();
-    bool is_connected() const { return fd_ != -1; }
-    void close_socket() { if (fd_ != -1) { close(fd_); fd_ = -1; } }
-    int get_socket_fd() const { return fd_; }
-    
-private:
-    int fd_;
-};
-
-struct HTTPResponse {
-    int status_code;
-    std::string data;
-    std::string get_url_content(const std::string& url);
-};
+    std::unique_ptr<MacSocket> socket_;
 #else
-// ESP32/ESPHome includes
-#include "esphome.h"
-#include "esphome/core/log.h"
-#include "esphome/components/http_request/http_request.h"
-#include "esphome/components/socket/socket.h"
+    std::unique_ptr<esphome::socket::Socket> socket_;
 #endif
-    // ... rest of the code remains the same ...
-    std::string http_response_buffer_;               ///< Response data accumulator
-    bool http_request_in_progress_;                  ///< HTTP operation active
-#endif
+    std::function<void(const uint8_t*, int)> socket_stream_callback_;
+    bool socket_operation_pending_;
+    bool socket_connected_;
+    int socket_bytes_remaining_;
+
+    // Statistics
+    int http_requests_sent_;
+    int http_requests_successful_;
+    int socket_connections_made_;
+    int socket_bytes_sent_;
+    int socket_bytes_received_;
+
+    // Error tracking
+    std::string last_error_message_;
 
     static const char* TAG;                          ///< Logging tag
 

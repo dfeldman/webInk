@@ -22,7 +22,7 @@ ESPHomeWebInkDisplay::ESPHomeWebInkDisplay(display::Display* display, font::Font
 
 void ESPHomeWebInkDisplay::clear_display() {
   if (display_) {
-    display_->fill(display::COLOR_ON);  // Clear to white for e-ink
+    display_->fill(display::COLOR_OFF);  // Clear to white for e-ink (COLOR_OFF = white)
   }
 }
 
@@ -114,14 +114,14 @@ void WebInkESPHomeComponent::setup() {
   setup_complete_ = true;
   ESP_LOGI(TAG, "WebInk component setup complete");
   
-  // 🚀 CRITICAL LOG: Component initialized
-  // Use a delay to ensure WiFi has time to connect
-  set_timeout("post_startup_log", 3000, [this]() {
-    std::string startup_log = "STARTUP: Component initialized - Boot type: " + 
-                             (is_wake_from_deep_sleep_ ? "Deep sleep wake" : "Cold boot") +
-                             ", Wake #" + std::to_string(controller_ ? controller_->get_state().wake_counter : 0);
-    post_critical_log_to_server(startup_log);
-  });
+  // DISABLED: This timeout callback causes stack overflow on ESP32C3
+  // The string concatenation + HTTP POST in the lambda exceeds stack limits
+  // set_timeout("post_startup_log", 3000, [this]() {
+  //   std::string startup_log = std::string("STARTUP: Component initialized - Boot type: ") + 
+  //                            (is_wake_from_deep_sleep_ ? "Deep sleep wake" : "Cold boot") +
+  //                            ", Wake #" + std::to_string(controller_ ? controller_->get_state().wake_counter : 0);
+  //   post_critical_log_to_server(startup_log);
+  // });
 }
 
 void WebInkESPHomeComponent::loop() {
@@ -144,6 +144,7 @@ void WebInkESPHomeComponent::initialize_webink_controller() {
   config_->set_api_key(api_key_.c_str());
   config_->set_display_mode(display_mode_.c_str());
   config_->set_socket_port(socket_port_);
+  ESP_LOGI(TAG, "Socket port set to: %d (from YAML: %d)", config_->socket_mode_port, socket_port_);
   
   // Create display manager
   display_manager_ = std::make_shared<ESPHomeWebInkDisplay>(display_component_, normal_font_, large_font_);
@@ -172,9 +173,17 @@ void WebInkESPHomeComponent::initialize_webink_controller() {
 void WebInkESPHomeComponent::setup_esphome_callbacks() {
   if (!controller_) return;
   
-  // WiFi status callback
+  // WiFi status callback with debug logging
   controller_->get_wifi_status = []() {
-    return wifi::global_wifi_component->is_connected();
+    bool connected = wifi::global_wifi_component->is_connected();
+    // Debug: Log WiFi component state occasionally
+    static unsigned long last_log = 0;
+    unsigned long now = millis();
+    if (now - last_log > 5000) {
+      ESP_LOGD(TAG, "[WIFI-CB] ESPHome WiFi is_connected()=%s", connected ? "true" : "false");
+      last_log = now;
+    }
+    return connected;
   };
   
   // Boot button status callback  
@@ -468,16 +477,11 @@ void WebInkESPHomeComponent::check_deep_sleep_trigger() {
 }
 
 void WebInkESPHomeComponent::post_critical_log_to_server(const std::string& message) {
-  // Only post if WiFi is connected and controller is ready
-  if (!controller_) return;
-  
-  // Check if WiFi is available (use the controller's callback)
-  if (controller_->get_wifi_status && !controller_->get_wifi_status()) {
-    ESP_LOGD(TAG, "Skipping server log - WiFi not connected: %s", message.c_str());
+  if (!controller_) {
+    ESP_LOGW(TAG, "Cannot post log - controller not initialized: %s", message.c_str());
     return;
   }
   
-  ESP_LOGI(TAG, "Posting to server: %s", message.c_str());
   controller_->post_status_to_server(message);
 }
 
@@ -503,18 +507,22 @@ bool WebInkESPHomeComponent::can_enter_deep_sleep() const {
   if (controller_) {
     UpdateState state = controller_->get_current_state();
     switch (state) {
-      case UpdateState::CONNECTING:
-      case UpdateState::CHECKING_HASH:
-      case UpdateState::DOWNLOADING_IMAGE:
-      case UpdateState::PROCESSING_IMAGE:
-      case UpdateState::UPDATING_DISPLAY:
+      case UpdateState::WIFI_WAIT:
+      case UpdateState::HASH_CHECK:
+      case UpdateState::HASH_REQUEST:
+      case UpdateState::HASH_PARSE:
+      case UpdateState::IMAGE_REQUEST:
+      case UpdateState::IMAGE_DOWNLOAD:
+      case UpdateState::IMAGE_PARSE:
+      case UpdateState::IMAGE_DISPLAY:
+      case UpdateState::DISPLAY_UPDATE:
         return false; // Active operations in progress
         
       case UpdateState::IDLE:
       case UpdateState::COMPLETE:
         break; // These states allow deep sleep
         
-      case UpdateState::ERROR:
+      case UpdateState::ERROR_DISPLAY:
         // Record error time to prevent deep sleep
         const_cast<WebInkESPHomeComponent*>(this)->last_error_time_ = millis();
         return false;
@@ -549,6 +557,98 @@ void WebInkESPHomeComponent::prepare_for_deep_sleep() {
   
   // Additional cleanup can be added here
   ESP_LOGI(TAG, "Ready for deep sleep");
+}
+
+// Public methods for YAML template sensors
+std::string WebInkESPHomeComponent::get_status_string() const {
+  if (!controller_) {
+    return "Controller not initialized";
+  }
+  return controller_->get_status_string();
+}
+
+std::string WebInkESPHomeComponent::get_current_state_string() const {
+  if (!controller_) {
+    return "UNKNOWN";
+  }
+  return std::string(update_state_to_string(controller_->get_current_state()));
+}
+
+std::string WebInkESPHomeComponent::get_last_hash() const {
+  if (!controller_) {
+    return "00000000";
+  }
+  return std::string(controller_->get_state().last_hash);
+}
+
+float WebInkESPHomeComponent::get_wake_counter() const {
+  if (!controller_) {
+    return 0.0f;
+  }
+  return (float)controller_->get_state().wake_counter;
+}
+
+float WebInkESPHomeComponent::get_boot_cycles() const {
+  if (!controller_) {
+    return 0.0f;
+  }
+  return (float)controller_->get_state().cycles_since_boot;
+}
+
+float WebInkESPHomeComponent::get_progress_percentage() const {
+  if (!controller_) {
+    return 0.0f;
+  }
+  float progress;
+  std::string status;
+  if (controller_->get_progress_info(progress, status)) {
+    return progress;
+  }
+  return 0.0f;
+}
+
+bool WebInkESPHomeComponent::get_progress_info(float& percentage, std::string& status) const {
+  if (!controller_) {
+    percentage = 0.0f;
+    status = "Controller not initialized";
+    return false;
+  }
+  return controller_->get_progress_info(percentage, status);
+}
+
+bool WebInkESPHomeComponent::is_deep_sleep_enabled_state() const {
+  if (!controller_) {
+    return true; // Default to enabled
+  }
+  return controller_->get_state().deep_sleep_enabled;
+}
+
+std::string WebInkESPHomeComponent::get_server_url_config() const {
+  if (!controller_) {
+    return server_url_;
+  }
+  return std::string(controller_->get_config().base_url);
+}
+
+std::string WebInkESPHomeComponent::get_device_id_config() const {
+  if (!controller_) {
+    return device_id_;
+  }
+  return std::string(controller_->get_config().device_id);
+}
+
+std::string WebInkESPHomeComponent::get_display_mode_config() const {
+  if (!controller_) {
+    return display_mode_;
+  }
+  return std::string(controller_->get_config().display_mode);
+}
+
+float WebInkESPHomeComponent::get_socket_port_config() const {
+  if (!controller_) {
+    return (float)socket_port_;
+  }
+  return (float)controller_->get_config().socket_mode_port;
 }
 
 } // namespace webink

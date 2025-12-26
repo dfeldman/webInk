@@ -66,5 +66,8 @@ async def to_code(config):
         button_component = await cg.get_variable(config["boot_button_id"])
         cg.add(var.set_boot_button(button_component))
 
-    # Include the main WebInk component header
-    cg.add_global(cg.RawStatement('#include "webink_esphome.h"'))
+    # Register source files with ESPHome build system
+    cg.add_define("USE_WEBINK")
+    
+    # Include the main WebInk component header  
+    cg.add_global(cg.RawStatement('#include "esphome/components/webink/webink_esphome.h"'))

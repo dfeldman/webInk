@@ -8,7 +8,7 @@
 
 #include "webink_config.h"
 #include <algorithm>
-#include <regex>
+#include <cstdlib>
 
 namespace esphome {
 namespace webink {
@@ -158,43 +158,56 @@ bool WebInkConfig::set_rows_per_slice(int rows) {
 //=============================================================================
 
 bool WebInkConfig::parse_display_mode(int& width, int& height, int& bits, ColorMode& mode) const {
-    // Parse format: "800x480x1xB"
-    std::regex pattern(R"((\d+)x(\d+)x(\d+)x([BGRC]))");
-    std::smatch matches;
+    // Parse format: "800x480x1xB" using manual parsing (no regex - avoids stack overflow)
+    const char* str = display_mode;
+    char* endptr;
     
-    // Convert char array to std::string for regex processing (temporary allocation)
-    std::string mode_str(display_mode);
+    // Parse width
+    width = strtol(str, &endptr, 10);
+    if (str == endptr || *endptr != 'x') {
+        ESP_LOGW(TAG, "Display mode parse failed at width: %s", display_mode);
+        return false;
+    }
+    str = endptr + 1;  // Skip 'x'
     
-    if (!std::regex_match(mode_str, matches, pattern)) {
-        ESP_LOGW(TAG, "Display mode regex parse failed: %s", display_mode);
+    // Parse height  
+    height = strtol(str, &endptr, 10);
+    if (str == endptr || *endptr != 'x') {
+        ESP_LOGW(TAG, "Display mode parse failed at height: %s", display_mode);
+        return false;
+    }
+    str = endptr + 1;  // Skip 'x'
+    
+    // Parse bits
+    bits = strtol(str, &endptr, 10);
+    if (str == endptr || *endptr != 'x') {
+        ESP_LOGW(TAG, "Display mode parse failed at bits: %s", display_mode);
+        return false;
+    }
+    str = endptr + 1;  // Skip 'x'
+    
+    // Parse color mode character
+    char mode_char = *str;
+    if (mode_char == '\0' || *(str + 1) != '\0') {
+        ESP_LOGW(TAG, "Display mode parse failed at color mode: %s", display_mode);
         return false;
     }
     
-    try {
-        width = std::stoi(matches[1].str());
-        height = std::stoi(matches[2].str());
-        bits = std::stoi(matches[3].str());
-        
-        char mode_char = matches[4].str()[0];
-        if (!parse_color_mode_char(mode_char, mode)) {
-            return false;
-        }
-        
-        // Validate parsed values
-        if (width <= 0 || height <= 0 || 
-            (bits != 1 && bits != 2 && bits != 8 && bits != 24)) {
-            ESP_LOGW(TAG, "Invalid display mode values: %dx%dx%d", width, height, bits);
-            return false;
-        }
-        
-        ESP_LOGD(TAG, "Parsed display mode: %dx%d, %d bits, mode=%s",
-                 width, height, bits, color_mode_to_string(mode));
-        
-        return true;
-    } catch (const std::exception& e) {
-        ESP_LOGW(TAG, "Display mode parsing exception: %s", e.what());
+    if (!parse_color_mode_char(mode_char, mode)) {
         return false;
     }
+    
+    // Validate parsed values
+    if (width <= 0 || height <= 0 || 
+        (bits != 1 && bits != 2 && bits != 8 && bits != 24)) {
+        ESP_LOGW(TAG, "Invalid display mode values: %dx%dx%d", width, height, bits);
+        return false;
+    }
+    
+    ESP_LOGD(TAG, "Parsed display mode: %dx%d, %d bits, mode=%s",
+             width, height, bits, color_mode_to_string(mode));
+    
+    return true;
 }
 
 bool WebInkConfig::validate_display_mode(const std::string& mode) const {

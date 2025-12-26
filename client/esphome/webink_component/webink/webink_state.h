@@ -20,12 +20,20 @@
 #include <functional>
 
 #ifdef WEBINK_MAC_INTEGRATION_TEST
+// Mock millis() for Mac integration tests
+unsigned long millis();
+#else
+// ESPHome millis() function - it's a global function in ESPHome
+#include "esphome/core/helpers.h"
+unsigned long millis();  // Forward declare global millis function
+#endif
+
+#ifdef WEBINK_MAC_INTEGRATION_TEST
 // Mac integration test mode - use local declarations
 void ESP_LOGI(const char* tag, const char* format, ...);
 void ESP_LOGW(const char* tag, const char* format, ...);
 void ESP_LOGE(const char* tag, const char* format, ...);
 void ESP_LOGD(const char* tag, const char* format, ...);
-unsigned long millis(); // Add millis() declaration for Mac
 #else
 // Normal ESPHome mode
 #include "esphome/core/log.h"

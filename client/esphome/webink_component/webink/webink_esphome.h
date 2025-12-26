@@ -10,8 +10,11 @@
 
 #include "esphome/core/component.h"
 #include "esphome/components/display/display.h"
+#include "esphome/components/wifi/wifi_component.h"
+
+#include "webink.h"
+
 #include "esphome/components/font/font.h"
-#include "esphome/components/deep_sleep/deep_sleep.h"
 #include "esphome/components/binary_sensor/binary_sensor.h"
 
 #ifdef USE_ESP32
@@ -105,6 +108,24 @@ class WebInkESPHomeComponent : public Component {
   void update_display_mode(const std::string& mode);
   void update_socket_port(int port);
 
+  // Public methods for YAML template sensors
+  std::string get_status_string() const;
+  std::string get_current_state_string() const; 
+  std::string get_last_hash() const;
+  float get_wake_counter() const;
+  float get_boot_cycles() const;
+  float get_progress_percentage() const;
+  bool get_progress_info(float& percentage, std::string& status) const;
+  
+  // Deep sleep status/control
+  bool is_deep_sleep_enabled_state() const;
+  
+  // Config accessors for text inputs  
+  std::string get_server_url_config() const;
+  std::string get_device_id_config() const;
+  std::string get_display_mode_config() const;
+  float get_socket_port_config() const;
+
  private:
   void initialize_webink_controller();
   void setup_esphome_callbacks();
@@ -144,10 +165,10 @@ private:
   // Deep sleep helper methods
   void setup_deep_sleep_logic();
   void check_deep_sleep_trigger();
-  bool can_enter_deep_sleep() const;
   void prepare_for_deep_sleep();
-  
-  // Server logging helper
+  bool can_enter_deep_sleep() const;
+
+  // Critical logging
   void post_critical_log_to_server(const std::string& message);
 };
 

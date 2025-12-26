@@ -27,6 +27,13 @@
 #include "webink_network.h"
 #include "webink_image.h"
 #include "webink_display.h"
+
+// Forward declare ESPHome deep sleep component
+namespace esphome {
+namespace deep_sleep {
+class DeepSleepComponent;
+}
+}
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
 #include "esphome/components/deep_sleep/deep_sleep_component.h"
@@ -93,7 +100,7 @@ namespace webink {
  * webink->clear_hash_force_update();
  * @endcode
  */
-class WebInkController : public Component {
+class WebInkController {
 public:
     /**
      * @brief Default constructor
@@ -110,29 +117,29 @@ public:
     //=========================================================================
 
     /**
-     * @brief ESPHome component setup phase
+     * @brief Initialize the WebInk controller
      * 
      * Called once during ESP32 boot to initialize the component.
      * Sets up all sub-components and initial state.
      */
-    void setup() override;
+    void setup();
 
     /**
-     * @brief ESPHome component main loop
+     * @brief Main processing loop
      * 
-     * Called continuously from ESPHome main loop. Executes the state machine
+     * Called from WebInkESPHomeComponent::loop(). Executes the state machine
      * with regular yield points to maintain system responsiveness.
      * 
      * This method is non-blocking and will yield control back to ESPHome
      * regularly to allow other components to operate.
      */
-    void loop() override;
+    void loop();
 
     /**
      * @brief Get component name for ESPHome logging
      * @return Component name string
      */
-    const char* get_component_name() override { return "webink_controller"; }
+    // Removed get_component_name() - not in ESPHome base class
 
     //=========================================================================
     // CONFIGURATION INTERFACE
@@ -261,6 +268,90 @@ public:
      */
     unsigned long get_time_in_current_state() const;
 
+    /**
+     * @brief Get wake counter (increments each deep sleep wake)
+     * @return Wake counter value
+     */
+    int get_wake_counter() const { return state_.wake_counter; }
+
+    /**
+     * @brief Get boot cycles (cycles since last power-on)
+     * @return Boot cycles count
+     */
+    int get_boot_cycles() const { return state_.cycles_since_boot; }
+
+    /**
+     * @brief Get current progress percentage
+     * @return Progress 0-100
+     */
+    float get_progress_percentage() const { return current_progress_; }
+
+    /**
+     * @brief Get current state as string (returns const char* to avoid stack allocation)
+     * @return State name string
+     */
+    const char* get_current_state_string() const { return update_state_to_string(current_state_); }
+
+    /**
+     * @brief Get last hash (returns const char* to avoid stack allocation)
+     * @return Hash string pointer
+     */
+    const char* get_last_hash() const { return state_.get_hash(); }
+
+    /**
+     * @brief Check if deep sleep is enabled
+     * @return True if deep sleep is enabled
+     */
+    bool is_deep_sleep_enabled_state() const { return state_.deep_sleep_enabled; }
+
+    /**
+     * @brief Get server URL (returns const char* to avoid stack allocation)
+     * @return Server URL string pointer
+     */
+    const char* get_server_url_config() const { return config_->base_url; }
+
+    /**
+     * @brief Get device ID (returns const char* to avoid stack allocation)
+     * @return Device ID string pointer
+     */
+    const char* get_device_id_config() const { return config_->device_id; }
+
+    /**
+     * @brief Get display mode (returns const char* to avoid stack allocation)
+     * @return Display mode string pointer
+     */
+    const char* get_display_mode_config() const { return config_->display_mode; }
+
+    /**
+     * @brief Get socket port
+     * @return Socket port number
+     */
+    int get_socket_port_config() const { return config_->socket_mode_port; }
+
+    /**
+     * @brief Update server URL from ESPHome input
+     * @param url New server URL
+     */
+    void update_server_url(const std::string& url) { config_->set_server_url(url.c_str()); }
+
+    /**
+     * @brief Update device ID from ESPHome input
+     * @param id New device ID
+     */
+    void update_device_id(const std::string& id) { config_->set_device_id(id.c_str()); }
+
+    /**
+     * @brief Update display mode from ESPHome input
+     * @param mode New display mode
+     */
+    void update_display_mode(const std::string& mode) { config_->set_display_mode(mode.c_str()); }
+
+    /**
+     * @brief Update socket port from ESPHome input
+     * @param port New socket port
+     */
+    void update_socket_port(int port) { config_->set_socket_port(port); }
+
     //=========================================================================
     // CALLBACK CONFIGURATION
     //=========================================================================
@@ -316,6 +407,12 @@ public:
      * @param port Socket port (0 = HTTP mode)
      */
     void set_socket_port(int port);
+
+    /**
+     * @brief Post status message to server
+     * @param message Status message to log
+     */
+    void post_status_to_server(const std::string& message);
 
 private:
     //=========================================================================
@@ -491,12 +588,6 @@ private:
      * @brief Prepare for deep sleep and enter sleep mode
      */
     void prepare_and_enter_deep_sleep();
-
-    /**
-     * @brief Post status message to server
-     * @param message Status message to log
-     */
-    void post_status_to_server(const std::string& message);
 
     //=========================================================================
     // UTILITY METHODS

@@ -32,12 +32,35 @@ namespace esphome {
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
 #include "esphome/components/socket/socket.h"
+#include "esp_http_client.h"
 #include <sys/socket.h>
 #include <netdb.h>
+
+// ESPHome millis() is available via helpers
 using namespace esphome;
 #endif
 
 #include <regex>
+
+#ifndef WEBINK_MAC_INTEGRATION_TEST
+// Static pointer for event handler to access response buffer (declared early for visibility)
+static std::string* s_http_response_buffer = nullptr;
+
+// Event handler for ESP-IDF HTTP client - captures response body
+static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
+    switch(evt->event_id) {
+        case HTTP_EVENT_ON_DATA:
+            // Append received data to response buffer
+            if (s_http_response_buffer != nullptr && evt->data_len > 0) {
+                s_http_response_buffer->append((char*)evt->data, evt->data_len);
+            }
+            break;
+        default:
+            break;
+    }
+    return ESP_OK;
+}
+#endif
 
 #ifdef WEBINK_MAC_INTEGRATION_TEST
 //=============================================================================
@@ -200,13 +223,13 @@ bool WebInkNetworkClient::http_get_async(const std::string& url,
                                          std::function<void(NetworkResult)> callback,
                                          unsigned long timeout_ms) {
     if (!validate_url(url)) {
-        log_message("Invalid URL format: " + url);
+        ESP_LOGW(TAG, "Invalid URL format");
         callback(create_error_result(ErrorType::INVALID_RESPONSE, "Invalid URL format"));
         return false;
     }
     
     if (pending_operation_) {
-        log_message("HTTP operation already pending");
+        ESP_LOGW(TAG, "HTTP operation already pending");
         callback(create_error_result(ErrorType::SERVER_UNREACHABLE, "Operation already pending"));
         return false;
     }
@@ -219,7 +242,6 @@ bool WebInkNetworkClient::http_get_async(const std::string& url,
     http_callback_ = callback;
     
     ESP_LOGI(TAG, "[HTTP] GET %s (timeout: %lu ms)", url.c_str(), current_timeout_ms_);
-    log_message("HTTP GET: " + url);
     
 #ifdef WEBINK_MAC_INTEGRATION_TEST
     // Mac integration test - use system curl immediately
@@ -229,12 +251,16 @@ bool WebInkNetworkClient::http_get_async(const std::string& url,
     callback(result);
 #else
     // ESP32 implementation using ESP-IDF HTTP client
+    // Reinitialize client if needed (it may have been cleaned up after previous request)
     if (esp_http_client_ == nullptr) {
-        ESP_LOGE(TAG, "HTTP client not initialized");
-        pending_operation_ = false;
-        http_operation_pending_ = false;
-        callback(create_error_result(ErrorType::SERVER_UNREACHABLE, "HTTP client not initialized"));
-        return false;
+        init_http_client();
+        if (esp_http_client_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to reinitialize HTTP client");
+            pending_operation_ = false;
+            http_operation_pending_ = false;
+            callback(create_error_result(ErrorType::SERVER_UNREACHABLE, "HTTP client init failed"));
+            return false;
+        }
     }
     
     // Configure the HTTP client for this request
@@ -242,44 +268,59 @@ bool WebInkNetworkClient::http_get_async(const std::string& url,
     esp_http_client_set_method(esp_http_client_, HTTP_METHOD_GET);
     esp_http_client_set_timeout_ms(esp_http_client_, current_timeout_ms_);
     
-    // Set up response buffer callback
+    // Clear response buffer and set up static pointer for event handler
     http_response_buffer_.clear();
-    http_response_buffer_.reserve(4096);  // Pre-allocate some space
+    s_http_response_buffer = &http_response_buffer_;  // Event handler will append data here
     
-    esp_http_client_set_event_handler(esp_http_client_, [](esp_http_client_event_t *evt) {
-        WebInkNetworkClient* self = static_cast<WebInkNetworkClient*>(evt->user_data);
-        
-        switch(evt->event_id) {
-            case HTTP_EVENT_ON_DATA:
-                // Accumulate response data
-                if (evt->data_len > 0) {
-                    self->http_response_buffer_.append(static_cast<char*>(evt->data), evt->data_len);
-                }
-                break;
-            default:
-                break;
-        }
-        return ESP_OK;
-    }, this);
-    
-    // Start the HTTP request (non-blocking)
+    // Perform the HTTP request (this is BLOCKING despite the "async" name)
+    // Response body is captured by the event handler during perform()
     esp_err_t err = esp_http_client_perform(esp_http_client_);
+    
+    // Clear static pointer after perform completes
+    s_http_response_buffer = nullptr;
+    
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP client perform failed: %s", esp_err_to_name(err));
         pending_operation_ = false;
         http_operation_pending_ = false;
         callback(create_error_result(ErrorType::SERVER_UNREACHABLE, 
-                                   "HTTP request failed: " + std::string(esp_err_to_name(err))));
+                                   "HTTP request failed"));
         return false;
     }
     
-    http_request_in_progress_ = true;
-    ESP_LOGD(TAG, "HTTP GET request started for %s", url.c_str());
-#endif
+    // Get response metadata
+    int content_length = esp_http_client_get_content_length(esp_http_client_);
+    int status_code = esp_http_client_get_status_code(esp_http_client_);
     
+    ESP_LOGD(TAG, "HTTP response: status=%d, content_length=%d, received=%zu bytes", 
+             status_code, content_length, http_response_buffer_.length());
+    
+    // Build result and call callback immediately (since perform() is blocking)
+    NetworkResult result;
+    result.success = (status_code >= 200 && status_code < 300);
+    result.status_code = status_code;
+    result.data = http_response_buffer_;
+    result.content = http_response_buffer_;
+    result.bytes_received = http_response_buffer_.length();
+    
+    if (!result.success) {
+        result.error_type = ErrorType::INVALID_RESPONSE;
+        result.error_message = "HTTP error";
+    }
+    
+    // Clean up HTTP client to avoid stale connection state on next request
+    pending_operation_ = false;
+    http_operation_pending_ = false;
+    http_response_buffer_.clear();
+    esp_http_client_cleanup(esp_http_client_);
+    esp_http_client_ = nullptr;  // Will be reinitialized on next request
+    
+    // Call callback with result
     http_requests_sent_++;
+    callback(result);
     
     return true;
+#endif
 }
 
 bool WebInkNetworkClient::http_post_async(const std::string& url,
@@ -318,12 +359,16 @@ bool WebInkNetworkClient::http_post_async(const std::string& url,
     callback(result);
 #else
     // ESP32 implementation using ESP-IDF HTTP client
+    // Reinitialize client if needed (it may have been cleaned up after previous request)
     if (esp_http_client_ == nullptr) {
-        ESP_LOGE(TAG, "HTTP client not initialized");
-        pending_operation_ = false;
-        http_operation_pending_ = false;
-        callback(create_error_result(ErrorType::SERVER_UNREACHABLE, "HTTP client not initialized"));
-        return false;
+        init_http_client();
+        if (esp_http_client_ == nullptr) {
+            ESP_LOGE(TAG, "Failed to reinitialize HTTP client for POST");
+            pending_operation_ = false;
+            http_operation_pending_ = false;
+            callback(create_error_result(ErrorType::SERVER_UNREACHABLE, "HTTP client init failed"));
+            return false;
+        }
     }
     
     // Configure the HTTP client for POST request
@@ -333,43 +378,59 @@ bool WebInkNetworkClient::http_post_async(const std::string& url,
     esp_http_client_set_post_field(esp_http_client_, body.c_str(), body.length());
     esp_http_client_set_header(esp_http_client_, "Content-Type", content_type.c_str());
     
-    // Set up response buffer callback  
+    // Clear response buffer and set up static pointer for event handler
     http_response_buffer_.clear();
-    http_response_buffer_.reserve(4096);
+    s_http_response_buffer = &http_response_buffer_;
     
-    esp_http_client_set_event_handler(esp_http_client_, [](esp_http_client_event_t *evt) {
-        WebInkNetworkClient* self = static_cast<WebInkNetworkClient*>(evt->user_data);
-        
-        switch(evt->event_id) {
-            case HTTP_EVENT_ON_DATA:
-                if (evt->data_len > 0) {
-                    self->http_response_buffer_.append(static_cast<char*>(evt->data), evt->data_len);
-                }
-                break;
-            default:
-                break;
-        }
-        return ESP_OK;
-    }, this);
-    
-    // Start the HTTP POST request
+    // Perform the HTTP POST request (blocking)
     esp_err_t err = esp_http_client_perform(esp_http_client_);
+    
+    // Clear static pointer after perform completes
+    s_http_response_buffer = nullptr;
+    
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP POST perform failed: %s", esp_err_to_name(err));
         pending_operation_ = false;
         http_operation_pending_ = false;
+        esp_http_client_cleanup(esp_http_client_);
+        esp_http_client_ = nullptr;
         callback(create_error_result(ErrorType::SERVER_UNREACHABLE, 
-                                   "HTTP POST failed: " + std::string(esp_err_to_name(err))));
+                                   "HTTP POST failed"));
         return false;
     }
     
-    http_request_in_progress_ = true;
-    ESP_LOGD(TAG, "HTTP POST request started for %s", url.c_str());
-#endif
+    // Get response metadata
+    int status_code = esp_http_client_get_status_code(esp_http_client_);
     
+    ESP_LOGD(TAG, "HTTP POST response: status=%d, received=%zu bytes", 
+             status_code, http_response_buffer_.length());
+    
+    // Build result
+    NetworkResult result;
+    result.success = (status_code >= 200 && status_code < 300);
+    result.status_code = status_code;
+    result.data = http_response_buffer_;
+    result.content = http_response_buffer_;
+    result.bytes_received = http_response_buffer_.length();
+    
+    if (!result.success) {
+        result.error_type = ErrorType::INVALID_RESPONSE;
+        result.error_message = "HTTP POST error";
+    }
+    
+    // Clean up HTTP client
+    pending_operation_ = false;
+    http_operation_pending_ = false;
+    http_response_buffer_.clear();
+    esp_http_client_cleanup(esp_http_client_);
+    esp_http_client_ = nullptr;
+    
+    // Call callback with result
     http_requests_sent_++;
+    callback(result);
     
     return true;
+#endif
 }
 
 //=============================================================================
@@ -395,9 +456,8 @@ bool WebInkNetworkClient::socket_connect_async(const std::string& host, int port
     
     ESP_LOGI(TAG, "[SOCKET] Connecting to %s:%d", host.c_str(), port);
     
-    // Set up operation state
-    pending_operation_ = true;
-    socket_operation_pending_ = true;
+    // Note: Don't set pending_operation_ here - connect is optimistic
+    // The pending operation will be set when we start socket_receive_stream
     operation_start_time_ = millis();
     current_timeout_ms_ = default_socket_timeout_ms_;
     
@@ -418,7 +478,7 @@ bool WebInkNetworkClient::socket_connect_async(const std::string& host, int port
         int result = socket_->connect(host, port);
 #else
         // ESPHome mode - use ESPHome socket
-        socket_ = esphome::socket::socket_ip(SOCK_STREAM, 0);
+        socket_ = socket::socket_ip(SOCK_STREAM, 0);
         if (!socket_) {
             log_message("Failed to create ESPHome socket");
             reset_operation_state();
@@ -427,7 +487,7 @@ bool WebInkNetworkClient::socket_connect_async(const std::string& host, int port
         
         // Set up address
         struct sockaddr_storage addr{};
-        socklen_t addrlen = esphome::socket::set_sockaddr(
+        socklen_t addrlen = socket::set_sockaddr(
             reinterpret_cast<sockaddr *>(&addr),
             sizeof(addr), host.c_str(), port);
             
@@ -462,8 +522,11 @@ bool WebInkNetworkClient::socket_connect_async(const std::string& host, int port
 #endif
         }
         
-        // ESPHome: Connection in progress - will be handled in loop()
+        // ESPHome: Connection in progress - mark as connected optimistically
+        // The socket will fail on send/receive if not actually connected
+        socket_connected_ = true;
         socket_connections_made_++;
+        ESP_LOGI(TAG, "[SOCKET] Connection initiated (async)");
         return true;
         
     } catch (const std::exception& e) {
@@ -636,10 +699,13 @@ std::string WebInkNetworkClient::get_last_error() const {
 void WebInkNetworkClient::init_http_client() {
 #ifndef WEBINK_MAC_INTEGRATION_TEST
     // Initialize ESP32 HTTP client
+    // ESP-IDF requires a URL at init time - use a placeholder that will be overwritten
     esp_http_client_config_t config = {};
+    config.url = "http://localhost/";  // Placeholder - will be set per-request
     config.timeout_ms = default_http_timeout_ms_;
     config.buffer_size = 4096;
     config.buffer_size_tx = 1024;
+    config.event_handler = http_event_handler;  // Set event handler to capture response body
     
     esp_http_client_ = esp_http_client_init(&config);
     http_request_in_progress_ = false;
@@ -678,7 +744,7 @@ void WebInkNetworkClient::process_http_operations() {
         result.bytes_received = http_response_buffer_.length();
         
         if (!result.success) {
-            result.error_type = ErrorType::SERVER_ERROR;
+            result.error_type = ErrorType::INVALID_RESPONSE;
             result.error_message = "HTTP request failed with status " + std::to_string(status_code);
             ESP_LOGW(TAG, "HTTP request failed: %d", status_code);
         } else {
@@ -848,7 +914,7 @@ bool WebInkNetworkClient::check_socket_errors() {
     // ESP32 - check ESPHome socket status
     try {
         // ESPHome sockets have error checking methods
-        if (!socket_->is_connected()) {
+        if (!socket_connected_) {
             return true; // Disconnected
         }
         

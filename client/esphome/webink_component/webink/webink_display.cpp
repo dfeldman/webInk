@@ -484,20 +484,21 @@ int WebInkDisplayManager::get_line_spacing(bool large) {
 uint32_t WebInkDisplayManager::convert_pixel_color(uint32_t pixel_value, ColorMode color_mode) {
     switch (color_mode) {
         case ColorMode::MONO_BLACK_WHITE:
-            // 0 = black, 1 = white (inverted for some displays)
-            return (pixel_value == 0) ? get_foreground_color() : get_background_color();
+            // PBM format: 1 = black, 0 = white
+            return (pixel_value != 0) ? get_foreground_color() : get_background_color();
             
         case ColorMode::GRAYSCALE_8BIT:
             // Convert grayscale to monochrome with threshold
             return (pixel_value < 128) ? get_foreground_color() : get_background_color();
             
-        case ColorMode::RGB_FULL_COLOR:
+        case ColorMode::RGB_FULL_COLOR: {
             // For monochrome displays, convert RGB to grayscale then threshold
             uint8_t r = (pixel_value >> 16) & 0xFF;
             uint8_t g = (pixel_value >> 8) & 0xFF;
             uint8_t b = pixel_value & 0xFF;
             uint8_t gray = (r * 299 + g * 587 + b * 114) / 1000; // ITU-R BT.601
             return (gray < 128) ? get_foreground_color() : get_background_color();
+        }
             
         default:
             return get_background_color();
