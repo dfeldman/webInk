@@ -1,0 +1,219 @@
+# WebInk ESPHome Configuration (Clean C++ Component)
+# Uses proper ESPHome component integration with minimal YAML
+
+esphome:
+  name: webink-display-clean
+  friendly_name: "WebInk Display (Clean)"
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# Enable logging
+logger:
+  level: INFO
+  logs:
+    webink.esphome: INFO
+    webink.controller: INFO
+    webink.network: DEBUG
+
+# Enable API and OTA
+api:
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# WiFi configuration  
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  ap:
+    ssid: "WebInk Setup"
+    password: "webink123"
+
+captive_portal:
+mdns:
+
+# SPI bus for e-ink display
+spi:
+  clk_pin: GPIO8
+  mosi_pin: GPIO10
+
+# E-ink display
+display:
+  - platform: waveshare_epaper
+    id: epd
+    model: 7.50inV2
+    cs_pin: GPIO3
+    dc_pin: GPIO5
+    reset_pin: GPIO2
+    busy_pin:
+      number: GPIO4
+      inverted: true
+    update_interval: never  # WebInk controls updates
+
+# Deep sleep
+deep_sleep:
+  id: deep_sleep_control
+  sleep_duration: 5min
+
+# Boot button for safety
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO9
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "BOOT Button"
+    id: boot_button
+
+# Fonts
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: roboto_16
+    size: 16
+    glyphs: '!"#$%&''()*+,-./:;<=>?@[\\]^_`{|}~ 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°'
+
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 700
+    id: roboto_24
+    size: 24
+    glyphs: '!"#$%&''()*+,-./:;<=>?@[\\]^_`{|}~ 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°'
+
+# Include WebInk C++ component
+external_components:
+  - source: webink_component
+    components: [webink]
+
+# WebInk component configuration (clean!)
+webink:
+  id: webink_ctrl
+  server_url: "http://127.0.0.1:8000"      # Local server (change if remote)
+  device_id: "webink-clean"                # Change to your device
+  api_key: "myapikey"                       # Change to your API key
+  display_mode: "800x480x1xB"
+  socket_port: 8091
+  rows_per_slice: 8
+  display_id: epd
+  normal_font: roboto_16
+  large_font: roboto_24
+  deep_sleep_id: deep_sleep_control
+  boot_button_id: boot_button
+
+# Status sensors (simple lambdas)
+text_sensor:
+  - platform: template
+    name: "WebInk Status"
+    update_interval: 30s
+    lambda: return id(webink_ctrl).get_status_string();
+
+  - platform: template
+    name: "WebInk State"
+    update_interval: 10s
+    lambda: return id(webink_ctrl).get_current_state_string();
+
+  - platform: template
+    name: "Last Hash"
+    update_interval: 60s
+    lambda: return id(webink_ctrl).get_last_hash();
+
+sensor:
+  - platform: template
+    name: "Wake Counter"
+    update_interval: 30s
+    lambda: return id(webink_ctrl).get_wake_counter();
+
+  - platform: template
+    name: "Boot Cycles"
+    update_interval: 30s
+    lambda: return id(webink_ctrl).get_boot_cycles();
+
+  - platform: template
+    name: "Update Progress"
+    unit_of_measurement: "%"
+    update_interval: 5s
+    lambda: |-
+      float progress;
+      std::string status;
+      if (id(webink_ctrl).get_progress_info(progress, status)) {
+        return progress;
+      }
+      return 0.0f;
+
+# Control buttons (simple lambdas)
+button:
+  - platform: template
+    name: "Manual Update"
+    on_press:
+      lambda: |-
+        if (id(webink_ctrl).trigger_manual_update()) {
+          ESP_LOGI("webink", "Manual update triggered");
+        } else {
+          ESP_LOGW("webink", "Update already in progress");
+        }
+
+  - platform: template
+    name: "Force Refresh" 
+    on_press:
+      lambda: |-
+        id(webink_ctrl).clear_hash_force_update();
+        ESP_LOGI("webink", "Hash cleared for forced refresh");
+
+  - platform: template
+    name: "Sleep Now"
+    on_press:
+      lambda: |-
+        if (id(webink_ctrl).trigger_deep_sleep()) {
+          ESP_LOGI("webink", "Deep sleep triggered");
+        } else {
+          ESP_LOGW("webink", "Deep sleep not available");
+        }
+
+# Configuration controls (simple lambdas)
+switch:
+  - platform: template
+    name: "Deep Sleep Enabled"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    lambda: return id(webink_ctrl).is_deep_sleep_enabled();
+    turn_on_action:
+      lambda: id(webink_ctrl).enable_deep_sleep(true);
+    turn_off_action:
+      lambda: id(webink_ctrl).enable_deep_sleep(false);
+
+text:
+  - platform: template
+    name: "Server URL"
+    optimistic: false
+    mode: text
+    lambda: return id(webink_ctrl).get_server_url();
+    set_action:
+      lambda: id(webink_ctrl).update_server_url(x);
+
+  - platform: template
+    name: "Device ID"
+    optimistic: false
+    mode: text
+    lambda: return id(webink_ctrl).get_device_id();
+    set_action:
+      lambda: id(webink_ctrl).update_device_id(x);
+
+number:
+  - platform: template
+    name: "Socket Port"
+    optimistic: false
+    min_value: 0
+    max_value: 65535
+    step: 1
+    lambda: return (float)id(webink_ctrl).get_socket_port();
+    set_action:
+      lambda: id(webink_ctrl).update_socket_port((int)x);

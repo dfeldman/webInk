@@ -1,0 +1,1462 @@
+esphome:
+  name: seeedstudio-screen-1
+  friendly_name: SeeedStudio screen 1
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"  # Increase watchdog timeout to 30s for HTTP operations
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API (required for ESPHome dashboard)
+api:
+
+# Enable OTA updates
+ota:
+  - platform: esphome
+    password: "eink-update"  # Change to a secret
+  - platform: web_server  # Enable OTA via web interface
+
+# Enable mDNS for .local hostname resolution
+mdns:
+  disabled: false
+
+# Web server for configuration and monitoring
+web_server:
+  port: 80
+  version: 2
+  include_internal: true
+
+# Fonts for error messages
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 900
+    id: roboto_24
+    size: 24
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 700
+    id: roboto_16
+    size: 16
+
+spi:
+  clk_pin: GPIO8
+  mosi_pin: GPIO10
+
+display:
+  - platform: waveshare_epaper
+    id: epd                  # <<— IMPORTANT: give the display an ID
+    model: 7.50inV2
+    cs_pin: GPIO3
+    dc_pin: GPIO5
+    reset_pin: GPIO2
+    busy_pin:
+      number: GPIO4
+      inverted: true
+    update_interval: never   # we’ll call update() manually
+
+
+http_request:
+  id: httpc
+  verify_ssl: false
+  timeout: 5s  # Keep short to avoid watchdog timeout
+  # ESP32-C3 has 400KB RAM, but HTTP client needs buffer space
+  # Start small - 809 bytes for 8 rows, increase as needed
+  buffer_size_rx: 2048  # Bytes to buffer for response body
+
+# Deep sleep configuration - wake every 5 minutes to check for updates
+## Future update to 15-20 minutes, this is just for testing
+deep_sleep:
+  id: deep_sleep_control
+  sleep_duration: 5min
+
+globals:
+  - id: slice_y_offset
+    type: int
+    initial_value: '0'
+  # Number of rows per slice (8 is the max that works reliably)
+  - id: rows_per_slice
+    type: int
+    initial_value: '8'
+  # Current slice being fetched (0-59 for 480 rows / 8 rows per slice)
+  - id: current_slice
+    type: int
+    initial_value: '0'
+  # Stored hash of last displayed content (persisted across deep sleep)
+  - id: last_hash
+    type: std::string
+    restore_value: true
+    initial_value: '"00000000"'
+  # Flag to track if an error occurred during hash check
+  - id: error_occurred
+    type: bool
+    initial_value: 'false'
+  # All-time cycle counter - persists across deep sleep and power cycles
+  - id: wake_counter
+    type: int
+    restore_value: true
+    initial_value: '0'
+  # Cycles since boot - resets to 0 on power loss, persists across deep sleep
+  - id: cycles_since_boot
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Flag to indicate if we should sleep after this cycle
+  - id: should_sleep
+    type: bool
+    initial_value: 'false'
+  # Sleep duration in seconds (fetched from server, default 60 seconds)
+  - id: sleep_duration_seconds
+    type: int
+    restore_value: true
+    initial_value: '60'
+  # Global flag to enable/disable deep sleep (controllable from web interface)
+  - id: deep_sleep_enabled
+    type: bool
+    restore_value: true
+    initial_value: 'true'
+  # Boot time in milliseconds (to prevent deep sleep for first 5 minutes)
+  - id: boot_time
+    type: unsigned long
+    restore_value: false
+    initial_value: '0'
+  # Last update time in milliseconds (to track when we last checked for updates)
+  - id: last_update_time
+    type: unsigned long
+    restore_value: false
+    initial_value: '0'
+  # Flag to track if last cycle had WiFi or server error (prevents deep sleep)
+  - id: last_cycle_had_error
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Flag to track if error screen is currently displayed (prevents redundant updates)
+  - id: error_screen_displayed
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  # TODO this is only use to report errors in socket mode - and
+  # it might not even work. Check.
+  - id: error_message
+    type: std::string
+    restore_value: true
+    initial_value: '""'
+  # Server base URL - can be changed at runtime via web UI
+  - id: base_url
+    type: std::string
+    restore_value: true
+    initial_value: '"http://192.168.68.69:8090"'
+  # Device ID for API authentication
+  - id: device_id
+    type: std::string
+    restore_value: true
+    initial_value: '"default"'
+  # API key for authentication
+  - id: api_key
+    type: std::string
+    restore_value: true
+    initial_value: '"myapikey"'
+  # Display mode (width x height x bits x color_mode)
+  - id: display_mode
+    type: std::string
+    restore_value: true
+    initial_value: '"800x480x1xB"'
+  # Socket mode port - if 0, socket mode is disabled and HTTP is used
+  # If non-zero, use socket protocol on this port for image fetching
+  - id: socket_mode_port
+    type: int
+    restore_value: true
+    initial_value: '8091'
+
+script:
+  # Reusable script to fetch and draw a slice of rows
+  - id: fetch_slice
+    mode: queued
+    parameters:
+      start_row: int
+      n_rows: int
+    then:
+      - globals.set:
+          id: slice_y_offset
+          value: !lambda 'return start_row;'
+      - http_request.get:
+          url: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s/get_image?api_key=%s&device=%s&mode=%s&x=0&y=%d&w=800&h=%d&format=pbm", 
+                     id(base_url).c_str(), id(api_key).c_str(), id(device_id).c_str(), 
+                     id(display_mode).c_str(), start_row, n_rows);
+            ESP_LOGI("eink", "Fetching: %s", buf);
+            return std::string(buf);
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  using esphome::Color;
+                  const int y_off = id(slice_y_offset);
+                  
+                  const uint8_t* base = reinterpret_cast<const uint8_t*>(body.data());
+                  const uint8_t* end  = base + body.size();
+                  const uint8_t* cur  = base;
+                  
+                  if (body.size() == 0) {
+                    ESP_LOGE("eink", "Empty body at y_off=%d", y_off);
+                    return;
+                  }
+                  
+                  // Log first 15 bytes of entire response for slice 0
+                  if (id(current_slice) == 0) {
+                    ESP_LOGI("eink", "First 15 bytes of response:");
+                    for (int i = 0; i < 15 && i < (int)body.size(); i++) {
+                      ESP_LOGI("eink", "  [%d] = 0x%02X ('%c')", i, base[i], (base[i] >= 32 && base[i] < 127) ? base[i] : '.');
+                    }
+                  }
+                  
+                  auto is_ws = [](uint8_t c)->bool { return c==' '||c=='\t'||c=='\r'||c=='\n'; };
+                  if ((end - cur) >= 3 && cur[0]==0xEF && cur[1]==0xBB && cur[2]==0xBF) cur += 3;
+                  
+                  auto next_token = [&](const uint8_t*& p)->std::pair<const uint8_t*, const uint8_t*> {
+                    while (p < end) {
+                      if (*p == '#') { while (p < end && *p != '\n') ++p; }
+                      else if (is_ws(*p)) ++p;
+                      else break;
+                    }
+                    const uint8_t* s = p;
+                    while (p < end && !is_ws(*p) && *p != '#') ++p;
+                    return {s,p};
+                  };
+                  
+                  auto tok = next_token(cur);
+                  if (tok.first==tok.second || tok.second-tok.first<2 || tok.first[0]!='P' || tok.first[1]!='4') {
+                    ESP_LOGW("eink","Bad PBM magic at y_off=%d", y_off);
+                    return;
+                  }
+                  
+                  tok = next_token(cur);
+                  if (tok.first==tok.second) return;
+                  int W = atoi(std::string((const char*)tok.first,(const char*)tok.second).c_str());
+                  
+                  tok = next_token(cur);
+                  if (tok.first==tok.second) return;
+                  int H = atoi(std::string((const char*)tok.first,(const char*)tok.second).c_str());
+                  
+                  // Skip any trailing whitespace after height (usually one \n)
+                  while (cur < end && is_ws(*cur)) cur++;
+                  
+                  const int row_bytes = (W + 7) / 8;
+                  const int expected_data_bytes = row_bytes * H;
+                  const int header_bytes = cur - base;
+                  
+                  ESP_LOGI("eink", "Slice %d: W=%d H=%d, header=%d bytes, data=%d bytes, total=%d", 
+                           id(current_slice), W, H, header_bytes, expected_data_bytes, (int)body.size());
+                  
+                  if (W != 800 || cur + expected_data_bytes > end) {
+                    ESP_LOGW("eink","Bad PBM size: %dx%d at y_off=%d", W, H, y_off);
+                    return;
+                  }
+                  
+                  // Log first 10 bytes of image data for slice 0 only
+                  if (id(current_slice) == 0) {
+                    ESP_LOGI("eink", "First 10 image data bytes:");
+                    for (int i = 0; i < 10 && cur + i < end; i++) {
+                      ESP_LOGI("eink", "  [%d] = 0x%02X", i, cur[i]);
+                    }
+                  }
+                  
+                  // Draw the slice (inverted: 1 bit = white, 0 bit = black)
+                  for (int y = 0; y < H; y++) {
+                    const uint8_t* row = cur + y * row_bytes;
+                    for (int x = 0; x < W; x++) {
+                      const uint8_t byte = row[x >> 3];
+                      if (!(byte & (0x80 >> (x & 7)))) {
+                        id(epd).draw_pixel_at(x, y + y_off, Color::BLACK);
+                      }
+                    }
+                  }
+                  
+                  ESP_LOGI("eink", "Drew slice %d: rows %d-%d", id(current_slice), y_off, y_off + H - 1);
+
+  # Fetch one slice and increment counter
+  - id: fetch_next_slice
+    mode: queued
+    then:
+      - script.execute:
+          id: fetch_slice
+          start_row: !lambda 'return id(current_slice) * id(rows_per_slice);'
+          n_rows: !lambda 'return id(rows_per_slice);'
+      - script.wait: fetch_slice
+      - globals.set:
+          id: current_slice
+          value: !lambda 'return id(current_slice) + 1;'
+  
+  # Post log message to server
+  - id: post_log
+    mode: queued
+    parameters:
+      message: string
+    then:
+      - http_request.post:
+          url: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s/post_log?api_key=%s&device=%s", 
+                     id(base_url).c_str(), id(api_key).c_str(), id(device_id).c_str());
+            return std::string(buf);
+          request_headers:
+            Content-Type: "text/plain"
+          body: !lambda 'return message;'
+  
+  # Fetch refresh interval from server
+  - id: fetch_refresh_interval
+    mode: queued
+    then:
+      - http_request.get:
+          url: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s/get_sleep?api_key=%s&device=%s", 
+                     id(base_url).c_str(), id(api_key).c_str(), id(device_id).c_str());
+            return std::string(buf);
+          capture_response: true
+          on_response:
+            then:
+              - lambda: |-
+                  if (body.size() == 0) {
+                    ESP_LOGW("eink", "Failed to get sleep duration, using default");
+                    return;
+                  }
+                  
+                  // Parse JSON response: {"sleep_seconds":300}
+                  std::string sleep_response((const char*)body.data(), body.size());
+                  
+                  // Simple parsing - find the number after "sleep_seconds":
+                  size_t pos = sleep_response.find("\"sleep_seconds\":");
+                  if (pos == std::string::npos) {
+                    pos = sleep_response.find("\"sleep_seconds\" :");
+                  }
+                  if (pos != std::string::npos) {
+                    // Skip to the number
+                    pos = sleep_response.find(":", pos) + 1;
+                    // Skip whitespace
+                    while (pos < sleep_response.size() && (sleep_response[pos] == ' ' || sleep_response[pos] == '\t')) pos++;
+                    // Parse the number
+                    int interval = 0;
+                    while (pos < sleep_response.size() && sleep_response[pos] >= '0' && sleep_response[pos] <= '9') {
+                      interval = interval * 10 + (sleep_response[pos] - '0');
+                      pos++;
+                    }
+                    id(sleep_duration_seconds) = interval;
+                    ESP_LOGI("eink", "Updated sleep duration to %d seconds (%d minutes)", 
+                             interval, interval / 60);
+                  } else {
+                    ESP_LOGW("eink", "Failed to parse sleep duration from response");
+                  }
+          on_error:
+            then:
+              - logger.log:
+                  level: WARN
+                  tag: "eink"
+                  format: "Failed to fetch sleep duration from server"
+  
+  # Conditional sleep - only sleeps if not first cycle since boot (for debugging/OTA)
+  - id: conditional_sleep
+    mode: queued
+    then:
+      - lambda: |-
+          #include "esp_system.h"
+          #include "esp_sleep.h"
+          
+          int duration_sec = id(sleep_duration_seconds);
+          int duration_min = duration_sec / 60;
+          unsigned long uptime_ms = millis();
+          unsigned long time_since_boot_ms = uptime_ms - id(boot_time);
+          unsigned long five_min_ms = 5 * 60 * 1000;
+          auto reset_reason = esp_reset_reason();
+          bool boot_button_pressed = id(boot_button).state;
+          
+          // Check all safety conditions
+          if (!id(deep_sleep_enabled)) {
+            ESP_LOGW("eink", "[SLEEP] Deep sleep is DISABLED via web interface");
+            ESP_LOGI("eink", "[SLEEP] Device will stay awake.");
+          } else if (duration_sec == 0) {
+            ESP_LOGW("eink", "[SLEEP] Sleep interval is 0 - server signal to disable sleep");
+            ESP_LOGI("eink", "[SLEEP] Device will stay awake.");
+          } else if (boot_button_pressed) {
+            ESP_LOGW("eink", "[SLEEP] BOOT button is held down - safety override");
+            ESP_LOGI("eink", "[SLEEP] Device will stay awake.");
+          } else if (id(last_cycle_had_error)) {
+            ESP_LOGW("eink", "[SLEEP] Last cycle had WiFi/server error - staying awake for troubleshooting");
+            ESP_LOGI("eink", "[SLEEP] Device will stay awake.");
+          } else if (reset_reason != ESP_RST_DEEPSLEEP && time_since_boot_ms < five_min_ms) {
+            unsigned long remaining_ms = five_min_ms - time_since_boot_ms;
+            ESP_LOGW("eink", "[SLEEP] Within 5 minutes of power-on - Mandatory skip for OTA safety");
+            ESP_LOGI("eink", "[SLEEP] Device will stay awake. %lu seconds until deep sleep enabled.", remaining_ms / 1000);
+          } else {
+            ESP_LOGI("eink", "[SLEEP] Preparing to enter deep sleep for %d seconds (%d minutes)", 
+                     duration_sec, duration_min);
+          }
+      # Log to server about sleep decision
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            #include "esp_system.h"
+            #include "esp_sleep.h"
+            
+            char buf[256];
+            int duration_sec = id(sleep_duration_seconds);
+            int duration_min = duration_sec / 60;
+            unsigned long time_since_boot_ms = millis() - id(boot_time);
+            unsigned long five_min_ms = 5 * 60 * 1000;
+            auto reset_reason = esp_reset_reason();
+            bool boot_button_pressed = id(boot_button).state;
+            
+            if (!id(deep_sleep_enabled)) {
+              snprintf(buf, sizeof(buf), 
+                       "[SLEEP] All-time #%d, Boot cycle #%d - SKIPPING deep sleep (disabled via web interface)",
+                       id(wake_counter), id(cycles_since_boot));
+            } else if (duration_sec == 0) {
+              snprintf(buf, sizeof(buf), 
+                       "[SLEEP] All-time #%d, Boot cycle #%d - SKIPPING deep sleep (interval=0, server signal)",
+                       id(wake_counter), id(cycles_since_boot));
+            } else if (boot_button_pressed) {
+              snprintf(buf, sizeof(buf), 
+                       "[SLEEP] All-time #%d, Boot cycle #%d - SKIPPING deep sleep (BOOT button held)",
+                       id(wake_counter), id(cycles_since_boot));
+            } else if (id(last_cycle_had_error)) {
+              snprintf(buf, sizeof(buf), 
+                       "[SLEEP] All-time #%d, Boot cycle #%d - SKIPPING deep sleep (last cycle had error)",
+                       id(wake_counter), id(cycles_since_boot));
+            } else if (reset_reason != ESP_RST_DEEPSLEEP && time_since_boot_ms < five_min_ms) {
+              snprintf(buf, sizeof(buf), 
+                       "[SLEEP] All-time #%d, Boot cycle #%d - SKIPPING deep sleep (within 5 min of power-on for OTA safety)",
+                       id(wake_counter), id(cycles_since_boot));
+            } else {
+              snprintf(buf, sizeof(buf), 
+                       "[SLEEP] All-time #%d, Boot cycle #%d - ENTERING deep sleep for %d seconds (%d min)",
+                       id(wake_counter), id(cycles_since_boot), duration_sec, duration_min);
+            }
+            return std::string(buf);
+      # Actually enter deep sleep if all safety checks pass
+      - lambda: |-
+          #include "esp_system.h"
+          #include "esp_sleep.h"
+          
+          unsigned long time_since_boot_ms = millis() - id(boot_time);
+          unsigned long five_min_ms = 5 * 60 * 1000;
+          auto reset_reason = esp_reset_reason();
+          bool boot_button_pressed = id(boot_button).state;
+          uint32_t duration_sec = id(sleep_duration_seconds);
+          
+          // Check all safety conditions
+          bool can_sleep = id(deep_sleep_enabled) &&
+                          duration_sec > 0 &&
+                          !boot_button_pressed &&
+                          !id(last_cycle_had_error) &&
+                          (reset_reason == ESP_RST_DEEPSLEEP || time_since_boot_ms >= five_min_ms);
+          
+          if (can_sleep) {
+            uint32_t duration_ms = duration_sec * 1000;
+            ESP_LOGI("eink", "[SLEEP] >>> Entering deep sleep NOW for %u ms <<<", duration_ms);
+            id(deep_sleep_control).set_sleep_duration(duration_ms);
+            id(deep_sleep_control).begin_sleep();
+          }
+  
+  # Display WiFi setup instructions for captive portal
+  - id: display_wifi_setup
+    mode: queued
+    then:
+      - if:
+          condition:
+            lambda: 'return id(error_screen_displayed);'
+          then:
+            - logger.log: "[CAPTIVE PORTAL] Error screen already displayed, skipping update to save display life"
+          else:
+            - logger.log: "[CAPTIVE PORTAL] Displaying WiFi setup instructions"
+            - lambda: |-
+                using esphome::Color;
+                
+                // Clear screen to white
+                id(epd).fill(Color::WHITE);
+                
+                // Draw border
+                id(epd).rectangle(10, 10, 780, 460, Color::BLACK);
+                id(epd).rectangle(12, 12, 776, 456, Color::BLACK);
+                
+                // WiFi icon (simplified)
+                int cx = 400, cy = 120;
+                for (int i = 0; i < 3; i++) {
+                  id(epd).circle(cx, cy + 40, 20 + i*15, Color::BLACK);
+                }
+                id(epd).filled_circle(cx, cy + 60, 8, Color::BLACK);
+                
+                // Title
+                id(epd).printf(400, 200, id(roboto_24), Color::BLACK, TextAlign::CENTER, "WiFi Setup Required");
+                
+                // Instructions
+                id(epd).printf(400, 250, id(roboto_16), Color::BLACK, TextAlign::CENTER, "1. Connect to WiFi network:");
+                id(epd).printf(400, 280, id(roboto_24), Color::BLACK, TextAlign::CENTER, "E-Ink Display Setup");
+                id(epd).printf(400, 320, id(roboto_16), Color::BLACK, TextAlign::CENTER, "Password: einksetup123");
+                
+                id(epd).printf(400, 370, id(roboto_16), Color::BLACK, TextAlign::CENTER, "2. Open browser (portal should auto-open)");
+                id(epd).printf(400, 400, id(roboto_16), Color::BLACK, TextAlign::CENTER, "or go to: http://192.168.4.1");
+                
+                id(epd).printf(400, 440, id(roboto_16), Color::BLACK, TextAlign::CENTER, "3. Configure your WiFi credentials and server address");
+                
+                id(epd).printf(400, 460, id(roboto_16), Color::BLACK, TextAlign::CENTER, "Will retry every 30 seconds");
+
+                // Update display
+                id(epd).update();
+                id(error_screen_displayed) = true;
+                ESP_LOGI("eink", "WiFi setup screen displayed");
+  
+  # Display error message on screen
+  - id: display_error
+    mode: queued
+    parameters:
+      error_msg: string
+    then:
+      - if:
+          condition:
+            lambda: 'return id(error_screen_displayed);'
+          then:
+            - logger.log:
+                format: "Error screen already displayed, skipping update to save display life (error: %s)"
+                args: ['error_msg.c_str()']
+          else:
+            - lambda: |-
+                using esphome::Color;
+                
+                // Clear screen to white
+                id(epd).fill(Color::WHITE);
+                
+                // Draw a border
+                id(epd).rectangle(10, 10, 780, 460, Color::BLACK);
+                id(epd).rectangle(12, 12, 776, 456, Color::BLACK);
+                
+                // Draw error icon (large X)
+                int cx = 400, cy = 150;
+                int size = 60;
+                // Draw thick X
+                for (int i = 0; i < 4; i++) {
+                  id(epd).line(cx - size + i, cy - size, cx + size + i, cy + size, Color::BLACK);
+                  id(epd).line(cx + size - i, cy - size, cx - size - i, cy + size, Color::BLACK);
+                }
+                
+                // Display error text
+                id(epd).printf(400, 250, id(roboto_24), Color::BLACK, TextAlign::CENTER, "ERROR");
+                id(epd).printf(400, 290, id(roboto_16), Color::BLACK, TextAlign::CENTER, "%s", error_msg.c_str());
+                
+                // Show retry interval (always 30 seconds due to interval timer)
+                id(epd).printf(400, 350, id(roboto_16), Color::BLACK, TextAlign::CENTER, "Will retry every 30 seconds");
+                
+                // Show device IP and server URL for debugging
+                auto ip_addresses = wifi::global_wifi_component->get_ip_addresses();
+                std::string ip_str = "No IP";
+                if (!ip_addresses.empty()) {
+                  ip_str = ip_addresses[0].str();
+                }
+                id(epd).printf(400, 390, id(roboto_16), Color::BLACK, TextAlign::CENTER, 
+                               "Device IP: %s", ip_str.c_str());
+                id(epd).printf(400, 420, id(roboto_16), Color::BLACK, TextAlign::CENTER, 
+                               "Server: %s", id(base_url).c_str());
+                
+                // Update display
+                id(epd).update();
+                id(error_screen_displayed) = true;
+                ESP_LOGI("eink", "Error message displayed on screen");
+  
+  # Check hash and update if changed
+  - id: check_and_update
+    mode: queued
+    then:
+      - logger.log: "========================================"
+      - lambda: |-
+          #include "esp_system.h"
+          #include "esp_sleep.h"
+          
+          // Record boot time only on actual power-on (not deep sleep wake)
+          if (id(cycles_since_boot) == 0) {
+            auto reset_reason = esp_reset_reason();
+            auto wakeup_cause = esp_sleep_get_wakeup_cause();
+            
+            ESP_LOGI("boot", "reset_reason=%d (DEEPSLEEP=%d), wakeup_cause=%d",
+                     (int)reset_reason, (int)ESP_RST_DEEPSLEEP, (int)wakeup_cause);
+            
+            if (reset_reason != ESP_RST_DEEPSLEEP) {
+              // This is a real power-on/reset, not a deep sleep wake
+              id(boot_time) = millis();
+              ESP_LOGI("eink", "[BOOT] Power-on detected - boot time recorded: %lu ms", id(boot_time));
+            } else {
+              ESP_LOGI("eink", "[BOOT] Wake from deep sleep - keeping existing boot time");
+            }
+          }
+          
+          // Record this update time
+          id(last_update_time) = millis();
+          
+          // Clear error flags at start of new cycle
+          id(last_cycle_had_error) = false;
+          id(error_screen_displayed) = false;
+          
+          id(wake_counter) = id(wake_counter) + 1;
+          id(cycles_since_boot) = id(cycles_since_boot) + 1;
+          
+          unsigned long time_since_boot_sec = (millis() - id(boot_time)) / 1000;
+          ESP_LOGI("eink", "[UPDATE] All-time cycle #%d, Boot cycle #%d, %lu sec since boot - Checking for updates...", 
+                   id(wake_counter), id(cycles_since_boot), time_since_boot_sec);
+      
+      # Small delay to let system settle and feed watchdog
+      - delay: 100ms
+      
+      # Wait for WiFi with timeout (keep short to avoid watchdog)
+      - wait_until:
+          condition: wifi.connected
+          timeout: 10s
+      
+      # Check if WiFi connected
+      - if:
+          condition:
+            wifi.connected:
+          then:
+            - logger.log: "WiFi connected, checking server..."
+            
+            # Small delay to let watchdog reset
+            - delay: 50ms
+            
+            # Log wake event to server
+            - script.execute:
+                id: post_log
+                message: !lambda |-
+                  char buf[256];
+                  unsigned long time_since_boot_sec = (millis() - id(boot_time)) / 1000;
+                  snprintf(buf, sizeof(buf), "[WAKE] All-time #%d, Boot cycle #%d, %lu sec since boot - Checking for updates", 
+                           id(wake_counter), id(cycles_since_boot), time_since_boot_sec);
+                  return std::string(buf);
+            
+            # Delay before next operation
+            - delay: 50ms
+            
+            # Fetch refresh interval from server (now that WiFi is connected)
+            - script.execute: fetch_refresh_interval
+            
+            # Delay before hash check
+            - delay: 50ms
+            
+            - logger.log:
+                format: "Current stored hash: %s"
+                args: [ 'id(last_hash).c_str()' ]
+            
+            # Fetch the current hash from server
+            - globals.set:
+                id: error_occurred
+                value: 'false'
+            - http_request.get:
+                url: !lambda |-
+                  char buf[256];
+                  snprintf(buf, sizeof(buf), "%s/get_hash?api_key=%s&device=%s&mode=%s", 
+                           id(base_url).c_str(), id(api_key).c_str(), id(device_id).c_str(), 
+                           id(display_mode).c_str());
+                  return std::string(buf);
+                capture_response: true
+                on_response:
+                  then:
+                    - lambda: |-
+                        if (body.size() == 0) {
+                          ESP_LOGE("eink", "Server returned empty response");
+                          id(error_occurred) = true;
+                          return;
+                        }
+                        
+                        // Parse JSON response: {"hash":"abc12345"} or {"hash": "abc12345"}
+                        std::string hashresponse((const char*)body.data(), body.size());
+                        ESP_LOGI("eink", "Hash response: %s", hashresponse.c_str());
+                        
+                        // Extract hash value (simple parsing - try both with and without space)
+                        size_t hash_start = hashresponse.find("\"hash\":\"");
+                        size_t offset = 8; // Length of "hash":"
+                        if (hash_start == std::string::npos) {
+                          // Try with space
+                          hash_start = hashresponse.find("\"hash\": \"");
+                          offset = 9; // Length of "hash": "
+                        }
+                        if (hash_start == std::string::npos) {
+                          ESP_LOGE("eink", "Failed to parse hash from response");
+                          id(error_occurred) = true;
+                          return;
+                        }
+                        hash_start += offset;
+                        size_t hash_end = hashresponse.find("\"", hash_start);
+                        if (hash_end == std::string::npos) {
+                          ESP_LOGE("eink", "Failed to parse hash from response");
+                          id(error_occurred) = true;
+                          return;
+                        }
+                        
+                        std::string new_hash = hashresponse.substr(hash_start, hash_end - hash_start);
+                        ESP_LOGI("eink", "Server hash: %s", new_hash.c_str());
+                        
+                        if (new_hash != id(last_hash)) {
+                          ESP_LOGI("eink", "[HASH] Hash changed! Triggering full refresh...");
+                          ESP_LOGI("eink", "[HASH]   Old: %s", id(last_hash).c_str());
+                          ESP_LOGI("eink", "[HASH]   New: %s", new_hash.c_str());
+                          id(last_hash) = new_hash;
+                          
+                          // Choose refresh method based on socket_mode_port
+                          if (id(socket_mode_port) > 0) {
+                            ESP_LOGI("eink", "[HASH] Using socket mode (port %d)", id(socket_mode_port));
+                            id(refresh_all_tiles_socket).execute();
+                          } else {
+                            ESP_LOGI("eink", "[HASH] Using HTTP mode");
+                            id(refresh_all_tiles).execute();
+                          }
+                        } else {
+                          ESP_LOGI("eink", "[HASH] Hash unchanged - no update needed");
+                          ESP_LOGI("eink", "========================================");
+                          id(should_sleep) = true;
+                        }
+                on_error:
+                  then:
+                    - logger.log: "========================================"
+                    - logger.log:
+                        level: ERROR
+                        tag: "eink"
+                        format: "HTTP request failed - server unreachable"
+                    - logger.log: "Server unreachable, displaying error..."
+                    - lambda: 'id(last_cycle_had_error) = true;'
+                    - script.execute:
+                        id: post_log
+                        message: !lambda |-
+                          char buf[256];
+                          snprintf(buf, sizeof(buf), 
+                                   "[ERROR] Wake #%d, Boot cycle #%d - Server unreachable (HTTP request failed)",
+                                   id(wake_counter), id(cycles_since_boot));
+                          return std::string(buf);
+                    - script.execute:
+                        id: display_error
+                        error_msg: "Server Unreachable - You can change the server URL in the web interface"
+                    - script.wait: display_error
+                    - logger.log: "========================================" 
+                    - script.execute: conditional_sleep
+            # Log hash comparison result to server
+            - script.execute:
+                id: post_log
+                message: !lambda |-
+                  char buf[256];
+                  if (id(should_sleep)) {
+                    snprintf(buf, sizeof(buf), "[HASH] All-time #%d, Boot cycle #%d - Hash unchanged (%s), no update needed", 
+                             id(wake_counter), id(cycles_since_boot), id(last_hash).c_str());
+                  } else {
+                    snprintf(buf, sizeof(buf), "[HASH] All-time #%d, Boot cycle #%d - Hash changed to %s, starting refresh", 
+                             id(wake_counter), id(cycles_since_boot), id(last_hash).c_str());
+                  }
+                  return std::string(buf);
+            # If hash unchanged, go to sleep (unless wake 0)
+            - if:
+                condition:
+                  lambda: 'return id(should_sleep);'
+                then:
+                  - script.execute: conditional_sleep
+            # Check if error occurred during parsing
+            - if:
+                condition:
+                  lambda: 'return id(error_occurred);'
+                then:
+                  - logger.log: "Error occurred, displaying message..."
+                  - lambda: 'id(last_cycle_had_error) = true;'
+                  - script.execute:
+                      id: post_log
+                      message: !lambda |-
+                        char buf[256];
+                        snprintf(buf, sizeof(buf), 
+                                 "[ERROR] All-time #%d, Boot cycle #%d - Invalid server response (failed to parse hash)",
+                                 id(wake_counter), id(cycles_since_boot));
+                        return std::string(buf);
+                  - script.execute:
+                      id: display_error
+                      error_msg: "Invalid Server Response"
+                  - script.wait: display_error
+                  - logger.log: "========================================"
+                  - script.execute: conditional_sleep
+          else:
+            - logger.log: "========================================"
+            - logger.log:
+                level: ERROR
+                tag: "eink"
+                format: "WiFi connection timeout after 10s"
+            - logger.log: "WiFi not connected - showing setup instructions..."
+            - lambda: 'id(last_cycle_had_error) = true;'
+            - script.execute:
+                id: post_log
+                message: !lambda |-
+                  char buf[256];
+                  snprintf(buf, sizeof(buf), 
+                           "[ERROR] All-time #%d, Boot cycle #%d - WiFi connection timeout after 10s",
+                           id(wake_counter), id(cycles_since_boot));
+                  return std::string(buf);
+            - script.execute: display_wifi_setup
+            - script.wait: display_wifi_setup
+            - logger.log: "========================================"
+            - script.execute: conditional_sleep
+  
+  # Main refresh script that fetches all 60 slices (480 rows / 8 rows per slice)
+  - id: refresh_all_tiles
+    mode: queued
+    then:
+      - deep_sleep.prevent: deep_sleep_control
+      - lambda: |-
+          using esphome::Color;
+          id(epd).fill(Color::WHITE);
+          id(current_slice) = 0;
+          ESP_LOGI("eink", "========================================");
+          ESP_LOGI("eink", "Starting full refresh: 60 slices of 8 rows each");
+          ESP_LOGI("eink", "========================================");
+      
+      # Fetch all 60 slices (0-59)
+      - repeat:
+          count: 60
+          then:
+            - script.execute: fetch_next_slice
+            - script.wait: fetch_next_slice
+      
+      # Finally update the display
+      - lambda: |-
+          ESP_LOGI("eink", "[REFRESH] All slices fetched, updating display...");
+          id(epd).update();
+          ESP_LOGI("eink", "[REFRESH] Display update complete!");
+          ESP_LOGI("eink", "========================================");
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), 
+                     "[REFRESH] All-time #%d, Boot cycle #%d - Display update complete, all 60 slices refreshed",
+                     id(wake_counter), id(cycles_since_boot));
+            return std::string(buf);
+      # Re-enable deep sleep now that refresh is complete
+      - deep_sleep.allow: deep_sleep_control
+      - script.execute: conditional_sleep
+  
+  # Socket-based refresh - fetches entire image via TCP socket (no HTTP overhead)
+  # Only supports 800x480x1xB PBM mode
+  - id: refresh_all_tiles_socket
+    mode: queued
+    then:
+      - deep_sleep.prevent: deep_sleep_control
+      - globals.set:
+          id: error_occurred
+          value: 'false'
+      - lambda: |-
+          using esphome::Color;
+          #include "esphome/components/socket/socket.h"
+          #include <sys/socket.h>
+
+          class WebInkSocketClient {
+           public:
+            WebInkSocketClient() = default;
+
+            bool connect(const std::string &host, uint16_t port) {
+              using esphome::socket::Socket;
+              using esphome::socket::socket_ip;
+              using esphome::socket::set_sockaddr;
+
+              sock_ = socket_ip(SOCK_STREAM, 0);
+              if (!sock_) {
+                return false;
+              }
+
+              struct sockaddr_storage addr{};
+              socklen_t addrlen = set_sockaddr(reinterpret_cast<sockaddr *>(&addr), sizeof(addr), host, port);
+              if (sock_->connect(reinterpret_cast<sockaddr *>(&addr), addrlen) < 0) {
+                sock_->close();
+                sock_.reset();
+                return false;
+              }
+
+              return true;
+            }
+
+            void print(const char *data) {
+              if (!sock_) return;
+              sock_->write(data, strlen(data));
+            }
+
+            void flush() {
+              // writes are blocking; nothing to flush
+            }
+
+            int available() {
+              if (!sock_) return 0;
+              return sock_->ready() ? 1 : 0;
+            }
+
+            int read() {
+              if (!sock_) return -1;
+              uint8_t byte;
+              auto res = sock_->read(&byte, 1);
+              if (res <= 0) return -1;
+              return static_cast<int>(byte);
+            }
+
+            void stop() {
+              if (!sock_) return;
+              sock_->close();
+              sock_.reset();
+            }
+
+           private:
+            std::unique_ptr<esphome::socket::Socket> sock_;
+          };
+
+          ESP_LOGI("eink", "========================================");
+          ESP_LOGI("eink", "[SOCKET] Starting socket-based refresh");
+          ESP_LOGI("eink", "========================================");
+          
+          // Clear display
+          id(epd).fill(Color::WHITE);
+          
+          // Extract server host from base_url
+          std::string url = id(base_url);
+          std::string host;
+          int http_port = 80;
+          
+          // Parse URL: http://hostname:port or http://hostname
+          size_t proto_end = url.find("://");
+          if (proto_end != std::string::npos) {
+            url = url.substr(proto_end + 3);  // Skip "http://"
+          }
+          
+          // Find port if specified
+          size_t port_pos = url.find(":");
+          if (port_pos != std::string::npos) {
+            host = url.substr(0, port_pos);
+            // Extract port number (for logging, not used for socket)
+            size_t path_pos = url.find("/", port_pos);
+            if (path_pos != std::string::npos) {
+              http_port = atoi(url.substr(port_pos + 1, path_pos - port_pos - 1).c_str());
+            } else {
+              http_port = atoi(url.substr(port_pos + 1).c_str());
+            }
+          } else {
+            // No port, find end of hostname
+            size_t path_pos = url.find("/");
+            if (path_pos != std::string::npos) {
+              host = url.substr(0, path_pos);
+            } else {
+              host = url;
+            }
+          }
+          
+          ESP_LOGI("eink", "[SOCKET] Extracted host: %s (HTTP port: %d)", host.c_str(), http_port);
+          ESP_LOGI("eink", "[SOCKET] Socket port: %d", id(socket_mode_port));
+
+          // Connect to socket server using ESPHome's socket primitives
+          WebInkSocketClient client;
+          if (!client.connect(host, static_cast<uint16_t>(id(socket_mode_port)))) {
+            ESP_LOGE("eink", "[SOCKET] Connection failed to %s:%d", host.c_str(), id(socket_mode_port));
+            id(error_occurred) = true;
+            id(last_cycle_had_error) = true;
+            // Store error details for display_error
+            char error_details[256];
+            snprintf(error_details, sizeof(error_details), 
+                     "Socket connection failed to %s:%d - Check server is running and socket_port is correct",
+                     host.c_str(), id(socket_mode_port));
+            id(error_message) = std::string(error_details);
+            return;
+          }
+          
+          ESP_LOGI("eink", "[SOCKET] Connected to %s:%d", host.c_str(), id(socket_mode_port));
+          
+          // Build request: webInkV1 <api_key> <device> <mode> <x> <y> <w> <h> <format>\n
+          char request[256];
+          snprintf(request, sizeof(request),
+                   "webInkV1 %s %s %s 0 0 800 480 pbm\n",
+                   id(api_key).c_str(), id(device_id).c_str(), id(display_mode).c_str());
+          
+          ESP_LOGI("eink", "[SOCKET] Sending request: %s", request);
+          client.print(request);
+          client.flush();
+          
+          // Calculate expected bytes: 800x480 pixels, 1-bit = 48,000 bytes
+          const int expected_bytes = (800 * 480) / 8;
+          ESP_LOGI("eink", "[SOCKET] Expecting %d bytes", expected_bytes);
+          
+          // Read and draw pixels directly
+          int bytes_received = 0;
+          int row_bytes = 100;  // 800 pixels / 8 bits = 100 bytes per row
+          uint8_t row_buffer[100];
+          unsigned long start_time = millis();
+          unsigned long last_log_time = start_time;
+          int last_log_bytes = 0;
+          
+          // Check for error response
+          bool is_error = false;
+          uint8_t first_bytes[6];
+          int first_bytes_read = 0;
+          
+          // Read first few bytes to check for "ERROR:"
+          unsigned long timeout = millis() + 10000;  // 10 second timeout
+          while (first_bytes_read < 6 && millis() < timeout) {
+            if (client.available()) {
+              first_bytes[first_bytes_read++] = client.read();
+            }
+          }
+          
+          if (first_bytes_read >= 6 && 
+              first_bytes[0] == 'E' && first_bytes[1] == 'R' && 
+              first_bytes[2] == 'R' && first_bytes[3] == 'O' && 
+              first_bytes[4] == 'R' && first_bytes[5] == ':') {
+            // This is an error message
+            ESP_LOGE("eink", "[SOCKET] Server returned error");
+            
+            // Read rest of error message
+            char error_msg[256];
+            int msg_len = 0;
+            timeout = millis() + 1000;
+            while (msg_len < 250 && millis() < timeout) {
+              if (client.available()) {
+                char c = client.read();
+                if (c == '\n') break;
+                error_msg[msg_len++] = c;
+              }
+            }
+            error_msg[msg_len] = '\0';
+            ESP_LOGE("eink", "[SOCKET] Server error: %s", error_msg);
+            
+            client.stop();
+            id(error_occurred) = true;
+            id(last_cycle_had_error) = true;
+            return;
+          }
+          
+          // Log first bytes for debugging
+          ESP_LOGI("eink", "[SOCKET] First 6 bytes: 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X",
+                   first_bytes[0], first_bytes[1], first_bytes[2],
+                   first_bytes[3], first_bytes[4], first_bytes[5]);
+          
+          // Process first bytes as pixel data
+          for (int i = 0; i < first_bytes_read && i < row_bytes; i++) {
+            row_buffer[i] = first_bytes[i];
+          }
+          bytes_received = first_bytes_read;
+          int row_buffer_pos = first_bytes_read;
+          
+          // Read remaining data and draw pixels
+          timeout = millis() + 30000;  // 30 second timeout for full image
+          int current_row = 0;
+          
+          while (bytes_received < expected_bytes && millis() < timeout) {
+            if (client.available()) {
+              uint8_t byte = client.read();
+              row_buffer[row_buffer_pos++] = byte;
+              bytes_received++;
+              
+              // When we have a complete row, draw it
+              if (row_buffer_pos >= row_bytes) {
+                // Draw this row
+                for (int x = 0; x < 800; x++) {
+                  const uint8_t pixel_byte = row_buffer[x >> 3];
+                  if (!(pixel_byte & (0x80 >> (x & 7)))) {
+                    id(epd).draw_pixel_at(x, current_row, Color::BLACK);
+                  }
+                }
+                
+                current_row++;
+                row_buffer_pos = 0;
+                
+                // Log progress every 5000 bytes or every 2 seconds
+                unsigned long now = millis();
+                if (bytes_received - last_log_bytes >= 5000 || now - last_log_time >= 2000) {
+                  float percent = (bytes_received * 100.0) / expected_bytes;
+                  ESP_LOGI("eink", "[SOCKET] Progress: %d/%d bytes (%.1f%%), row %d/480",
+                           bytes_received, expected_bytes, percent, current_row);
+                  last_log_bytes = bytes_received;
+                  last_log_time = now;
+                }
+              }
+            }
+          }
+          
+          client.stop();
+          
+          unsigned long elapsed = millis() - start_time;
+          float seconds = elapsed / 1000.0;
+          float kbps = (bytes_received * 8.0) / (seconds * 1000.0);
+          
+          ESP_LOGI("eink", "[SOCKET] Received %d/%d bytes in %.2f seconds (%.1f kbps)",
+                   bytes_received, expected_bytes, seconds, kbps);
+          
+          if (bytes_received < expected_bytes) {
+            ESP_LOGE("eink", "[SOCKET] Incomplete data! Missing %d bytes",
+                     expected_bytes - bytes_received);
+            id(error_occurred) = true;
+            id(last_cycle_had_error) = true;
+            return;
+          }
+          
+          ESP_LOGI("eink", "[SOCKET] All pixel data received, updating display...");
+          id(epd).update();
+          ESP_LOGI("eink", "[SOCKET] Display update complete!");
+          ESP_LOGI("eink", "========================================");
+      
+      # Check if error occurred during socket operation
+      - if:
+          condition:
+            lambda: 'return id(error_occurred);'
+          then:
+            # Display error on screen
+            - script.execute:
+                id: display_error
+                error_msg: "Socket Error - Check server connection and port settings in web interface"
+            - script.wait: display_error
+            # Log error to server via HTTP
+            - script.execute:
+                id: post_log
+                message: !lambda |-
+                  char buf[256];
+                  snprintf(buf, sizeof(buf), 
+                           "[SOCKET ERROR] All-time #%d, Boot cycle #%d - Socket connection or data transfer failed",
+                           id(wake_counter), id(cycles_since_boot));
+                  return std::string(buf);
+          else:
+            # Log success to server via HTTP
+            - script.execute:
+                id: post_log
+                message: !lambda |-
+                  char buf[256];
+                  snprintf(buf, sizeof(buf), 
+                           "[SOCKET] All-time #%d, Boot cycle #%d - Socket refresh complete, 48000 bytes received",
+                           id(wake_counter), id(cycles_since_boot));
+                  return std::string(buf);
+      
+      # Re-enable deep sleep
+      - deep_sleep.allow: deep_sleep_control
+      - script.execute: conditional_sleep
+
+# Sensors to expose parameters on web interface
+text_sensor:
+  - platform: template
+    name: "Last Content Hash"
+    id: last_hash_sensor
+    update_interval: 10s
+    lambda: |-
+      return id(last_hash);
+  
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    ssid:
+      name: "WiFi SSID"
+
+sensor:
+  - platform: template
+    name: "All-Time Cycles"
+    id: wake_counter_sensor
+    update_interval: 10s
+    lambda: |-
+      return id(wake_counter);
+  
+  - platform: template
+    name: "Cycles Since Boot"
+    id: cycles_sensor
+    update_interval: 10s
+    lambda: |-
+      return id(cycles_since_boot);
+  
+  - platform: template
+    name: "Time Since Boot (seconds)"
+    id: time_since_boot_sensor
+    update_interval: 10s
+    lambda: |-
+      if (id(boot_time) == 0) return 0;
+      return (millis() - id(boot_time)) / 1000.0;
+  
+  - platform: template
+    name: "Sleep Duration (minutes)"
+    id: sleep_duration_sensor
+    update_interval: 10s
+    lambda: |-
+      return id(sleep_duration_seconds) / 60.0;
+  
+  - platform: template
+    name: "Socket Mode Port"
+    id: socket_mode_port_sensor
+    update_interval: 10s
+    lambda: |-
+      return id(socket_mode_port);
+  
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+# Binary sensor for BOOT button (GPIO9 on ESP32-C3)
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO9
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "BOOT Button"
+    id: boot_button
+
+# Buttons for manual control
+button:
+  - platform: template
+    name: "Refresh Display Now"
+    on_press:
+      - logger.log: "Manual refresh triggered from web interface"
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), 
+                     "[MANUAL] All-time #%d, Boot cycle #%d - Manual refresh triggered from web interface",
+                     id(wake_counter), id(cycles_since_boot));
+            return std::string(buf);
+      - lambda: |-
+          if (id(socket_mode_port) > 0) {
+            ESP_LOGI("eink", "[MANUAL] Using socket mode (port %d)", id(socket_mode_port));
+            id(refresh_all_tiles_socket).execute();
+          } else {
+            ESP_LOGI("eink", "[MANUAL] Using HTTP mode");
+            id(refresh_all_tiles).execute();
+          }
+  
+  - platform: template
+    name: "Enter Deep Sleep Now"
+    on_press:
+      - logger.log: "Manual deep sleep triggered from web interface"
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), 
+                     "[MANUAL] All-time #%d, Boot cycle #%d - Manual deep sleep button pressed",
+                     id(wake_counter), id(cycles_since_boot));
+            return std::string(buf);
+      - script.execute: conditional_sleep
+  
+  - platform: template
+    name: "Clear Hash (Force Refresh)"
+    on_press:
+      - logger.log: "Hash cleared - next cycle will force refresh"
+      - globals.set:
+          id: last_hash
+          value: '"00000000"'
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), 
+                     "[MANUAL] All-time #%d, Boot cycle #%d - Hash cleared to force refresh on next cycle",
+                     id(wake_counter), id(cycles_since_boot));
+            return std::string(buf);
+  
+  - platform: template
+    name: "Reconfigure WiFi"
+    on_press:
+      - logger.log: "WiFi reconfiguration requested - disconnecting and showing setup screen"
+      - script.execute: display_wifi_setup
+      - script.execute:
+          id: post_log
+          message: "[MANUAL] WiFi reconfiguration requested - disconnecting to activate AP mode"
+      - wifi.disable:
+      - delay: 2s
+      - wifi.enable:
+      - logger.log: "WiFi disabled and re-enabled - AP mode should activate. Connect to 'E-Ink Display Setup'"
+
+# Switch to enable/disable deep sleep
+switch:
+  - platform: template
+    name: "Deep Sleep Enabled"
+    id: deep_sleep_switch
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    lambda: |-
+      return id(deep_sleep_enabled);
+    turn_on_action:
+      - globals.set:
+          id: deep_sleep_enabled
+          value: 'true'
+      - logger.log: "Deep sleep ENABLED via web interface"
+      - script.execute:
+          id: post_log
+          message: "Deep sleep ENABLED via web interface"
+    turn_off_action:
+      - globals.set:
+          id: deep_sleep_enabled
+          value: 'false'
+      - logger.log: "Deep sleep DISABLED via web interface"
+      - script.execute:
+          id: post_log
+          message: "Deep sleep DISABLED via web interface"
+
+# Text input for server URL - takes effect immediately!
+text:
+  - platform: template
+    name: "Server URL"
+    id: server_url_input
+    optimistic: false
+    mode: text
+    lambda: |-
+      return id(base_url);
+    set_action:
+      - globals.set:
+          id: base_url
+          value: !lambda 'return x;'
+      - logger.log:
+          format: "✓ Server URL updated to: %s - will use on next refresh (no restart needed!)"
+          args: ['x.c_str()']
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), "[CONFIG] Server URL changed to: %s", x.c_str());
+            return std::string(buf);
+  
+  - platform: template
+    name: "Device ID"
+    id: device_id_input
+    optimistic: false
+    mode: text
+    lambda: |-
+      return id(device_id);
+    set_action:
+      - globals.set:
+          id: device_id
+          value: !lambda 'return x;'
+      - logger.log:
+          format: "✓ Device ID updated to: %s - will use on next refresh (no restart needed!)"
+          args: ['x.c_str()']
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), "[CONFIG] Device ID changed to: %s", x.c_str());
+            return std::string(buf);
+  
+  - platform: template
+    name: "API Key"
+    id: api_key_input
+    optimistic: false
+    mode: text
+    lambda: |-
+      return id(api_key);
+    set_action:
+      - globals.set:
+          id: api_key
+          value: !lambda 'return x;'
+      - logger.log:
+          format: "✓ API Key updated - will use on next refresh (no restart needed!)"
+      - script.execute:
+          id: post_log
+          message: "[CONFIG] API Key updated"
+  
+  - platform: template
+    name: "Display Mode"
+    id: display_mode_input
+    optimistic: false
+    mode: text
+    lambda: |-
+      return id(display_mode);
+    set_action:
+      - globals.set:
+          id: display_mode
+          value: !lambda 'return x;'
+      - logger.log:
+          format: "✓ Display Mode updated to: %s - will use on next refresh (no restart needed!)"
+          args: ['x.c_str()']
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            char buf[256];
+            snprintf(buf, sizeof(buf), "[CONFIG] Display Mode changed to: %s", x.c_str());
+            return std::string(buf);
+
+# Number input for socket mode port
+number:
+  - platform: template
+    name: "Socket Mode Port"
+    id: socket_mode_port_input
+    optimistic: false
+    min_value: 0
+    max_value: 65535
+    step: 1
+    mode: box
+    lambda: |-
+      return id(socket_mode_port);
+    set_action:
+      - globals.set:
+          id: socket_mode_port
+          value: !lambda 'return (int)x;'
+      - lambda: |-
+          if ((int)x == 0) {
+            ESP_LOGI("eink", "✓ Socket mode DISABLED - will use HTTP mode on next refresh");
+          } else {
+            ESP_LOGI("eink", "✓ Socket mode port updated to: %d - will use socket mode on next refresh", (int)x);
+          }
+      - script.execute:
+          id: post_log
+          message: !lambda |-
+            char buf[256];
+            if ((int)x == 0) {
+              snprintf(buf, sizeof(buf), "[CONFIG] Socket mode DISABLED - using HTTP mode");
+            } else {
+              snprintf(buf, sizeof(buf), "[CONFIG] Socket mode port changed to: %d", (int)x);
+            }
+            return std::string(buf);
+
+# normally, we call check_and_update when wifi is connected - either when device is first turned on, OR 
+# when we wake from deep sleep.
+# but, if deep sleep is manually disabled by the user, we still want to call check_and_update occasionally. 
+# We check every 30 seconds, but only run update if sleep_duration_seconds has elapsed since last update. 
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          unsigned long now = millis();
+          unsigned long elapsed_ms = now - id(last_update_time);
+          unsigned long interval_ms = id(sleep_duration_seconds) * 1000;
+          
+          // Only trigger if enough time has elapsed AND script is not already running
+          if (elapsed_ms >= interval_ms) {
+            if (id(check_and_update).is_running()) {
+              ESP_LOGD("eink", "[INTERVAL] Update already in progress, skipping");
+            } else {
+              ESP_LOGI("eink", "[INTERVAL] %lu seconds elapsed since last update - triggering check", elapsed_ms / 1000);
+              id(check_and_update).execute();
+            }
+          }
+
+# Trigger hash check after Wi-Fi connects (initial boot only)
+wifi:
+  # Try to connect with saved credentials first
+  # If no saved credentials, will fall back to AP mode
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  
+  # Enable credential saving from captive portal
+  enable_on_boot: true
+  
+  # Enable Access Point as fallback if WiFi fails
+  ap:
+    ssid: "E-Ink Display Setup"
+    password: "einksetup123"
+  
+  on_connect:
+    - if:
+        condition:
+          lambda: 'return id(cycles_since_boot) == 0;' 
+        then:
+          - logger.log: "[WIFI] Initial WiFi connection - triggering first update"
+          - script.execute: check_and_update
+
+# Captive portal for easy WiFi configuration
+captive_portal:
+

@@ -1,0 +1,331 @@
+# WebInk ESPHome Configuration (C++ Component Version)
+# Replaces the complex YAML scripts with modular C++ component
+
+# Configuration values (can use secrets or override)
+substitutions:
+  webink_server_url: "http://127.0.0.1:8000"      # Local server (change if remote)
+  webink_device_id: "webink-cpp-display"
+  webink_api_key: "myapikey"
+  webink_display_mode: "800x480x1xB"  
+  webink_socket_port: "8091"
+
+esphome:
+  name: webink-display-cpp
+  friendly_name: "WebInk Display (C++)"
+  platformio_options:
+    # Increase build memory for C++ component
+    build_flags: 
+      - -DBOARD_HAS_PSRAM
+    build_unflags:
+      - -fno-exceptions
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
+      CONFIG_FREERTOS_THREAD_LOCAL_STORAGE_POINTERS: "2"
+
+# Enable logging
+logger:
+  level: DEBUG
+  logs:
+    webink: INFO
+    webink.controller: INFO
+    webink.network: DEBUG
+    webink.image: INFO
+    webink.display: INFO
+
+# Enable API
+api:
+
+# Enable OTA updates
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+# Enable web server
+web_server:
+  port: 80
+  version: 3
+
+# mDNS
+mdns:
+  disabled: false
+
+# WiFi configuration
+wifi:
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+  enable_on_boot: true
+  
+  # Enable captive portal for configuration
+  ap:
+    ssid: "WebInk Display Setup"
+    password: "webink123"
+
+  # Trigger update when WiFi connects
+  on_connect:
+    - lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        if (controller->get_state().cycles_since_boot == 0) {
+          ESP_LOGI("webink", "Initial WiFi connection - triggering first update");
+          controller->trigger_manual_update();
+        }
+
+
+captive_portal:
+
+# SPI bus for the display
+spi:
+  clk_pin: GPIO8
+  mosi_pin: GPIO10
+
+# E-ink display
+display:
+  - platform: waveshare_epaper
+    id: epd
+    model: 7.50inV2
+    cs_pin: GPIO3
+    dc_pin: GPIO5
+    reset_pin: GPIO2
+    busy_pin:
+      number: GPIO4
+      inverted: true
+    update_interval: never  # WebInk controls updates
+
+# Deep sleep component
+deep_sleep:
+  id: deep_sleep_control
+  sleep_duration: 5min
+
+# BOOT button for safety override
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO9
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    name: "BOOT Button"
+    id: boot_button
+
+# Fonts for the WebInk component
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 400
+    id: roboto_16
+    size: 16
+    glyphs: '!"#$%&''()*+,-./:;<=>?@[\]^_`{|}~ 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°'
+
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: 700
+    id: roboto_24
+    size: 24
+    glyphs: '!"#$%&''()*+,-./:;<=>?@[\]^_`{|}~ 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz°'
+
+# Include WebInk C++ component (local directory)
+external_components:
+  - source: 
+      type: local
+      path: webink_component
+    components: [ webink ]
+
+# WebInk component configuration
+webink:
+  id: webink_ctrl
+  server_url: "${webink_server_url}"
+  device_id: "${webink_device_id}"
+  api_key: "${webink_api_key}"
+  display_mode: "${webink_display_mode}"
+  socket_port: ${webink_socket_port}
+  rows_per_slice: 8
+  display_id: epd
+  normal_font: roboto_16  
+  large_font: roboto_24
+  deep_sleep_id: deep_sleep_control
+
+
+# Status sensors
+text_sensor:
+  - platform: template
+    name: "WebInk Status"
+    id: webink_status
+    update_interval: 30s
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return controller->get_status_string();
+
+  - platform: template
+    name: "WebInk State"
+    id: webink_state
+    update_interval: 10s
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return std::string(esphome::webink::update_state_to_string(controller->get_current_state()));
+
+  - platform: template
+    name: "Last Hash"
+    id: last_hash
+    update_interval: 60s
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return std::string(controller->get_state().get_hash());
+
+  - platform: wifi_info
+    ip_address:
+      name: "IP Address"
+    ssid:
+      name: "WiFi SSID"
+
+sensor:
+  - platform: template
+    name: "Wake Counter"
+    id: wake_counter
+    update_interval: 30s
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return (float)controller->get_state().wake_counter;
+
+  - platform: template
+    name: "Boot Cycles"
+    id: boot_cycles
+    update_interval: 30s
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return (float)controller->get_state().cycles_since_boot;
+
+  - platform: template
+    name: "Update Progress"
+    id: update_progress
+    unit_of_measurement: "%"
+    update_interval: 5s
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      float progress;
+      std::string status;
+      if (controller->get_progress_info(progress, status)) {
+        return progress;
+      }
+      return 0.0f;
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+# Control buttons
+button:
+  - platform: template
+    name: "Manual Update"
+    on_press:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        if (controller->trigger_manual_update()) {
+          ESP_LOGI("webink", "Manual update triggered");
+        } else {
+          ESP_LOGW("webink", "Update already in progress");
+        }
+
+  - platform: template
+    name: "Force Refresh"
+    on_press:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        controller->clear_hash_force_update();
+        ESP_LOGI("webink", "Hash cleared for forced refresh");
+
+  - platform: template
+    name: "Sleep Now"
+    on_press:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        if (controller->trigger_deep_sleep()) {
+          ESP_LOGI("webink", "Deep sleep triggered");
+        } else {
+          ESP_LOGW("webink", "Deep sleep conditions not met");
+        }
+
+# Configuration controls
+switch:
+  - platform: template
+    name: "Deep Sleep Enabled"
+    id: deep_sleep_switch
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return controller->get_state().deep_sleep_enabled;
+    turn_on_action:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        controller->enable_deep_sleep(true);
+    turn_off_action:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        controller->enable_deep_sleep(false);
+
+text:
+  - platform: template
+    name: "Server URL"
+    optimistic: false
+    mode: text
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return std::string(controller->get_config().base_url);
+    set_action:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        controller->set_server_url(x);
+
+  - platform: template
+    name: "Device ID"
+    optimistic: false
+    mode: text
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return std::string(controller->get_config().device_id);
+    set_action:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        controller->set_device_id(x);
+
+  - platform: template
+    name: "Display Mode"
+    optimistic: false
+    mode: text
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return std::string(controller->get_config().display_mode);
+    set_action:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        controller->set_display_mode(x);
+
+number:
+  - platform: template
+    name: "Socket Port"
+    optimistic: false
+    min_value: 0
+    max_value: 65535
+    step: 1
+    mode: box
+    lambda: |-
+      auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+      return (float)controller->get_config().socket_mode_port;
+    set_action:
+      lambda: |-
+        auto* controller = static_cast<esphome::webink::WebInkController*>(id(webink_ctrl));
+        controller->set_socket_port((int)x);
+
